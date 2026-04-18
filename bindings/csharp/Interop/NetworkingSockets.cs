@@ -148,7 +148,7 @@ namespace Valve.Sockets
 
         // ── Real-time stats ──────────────────────────────────────────────────────
 
-        // SteamNetConnectionRealTimeStatus_t layout (x64, no padding):
+        // SteamNetConnectionRealTimeStatus_t layout — identical on Windows and Linux x64:
         // offset 0:  m_eState  (int, 4)
         // offset 4:  m_nPing   (int, 4)  ← milliseconds
         // offset 8:  m_flConnectionQualityLocal  (float, 4)  ← 0..1, 1=no loss

@@ -201,12 +201,14 @@ namespace Valve.Sockets
         internal static extern void SteamAPI_SteamNetworkingMessage_t_Release(
             IntPtr self);
 
-        // ── SteamNetworkingMessage_t field offsets (x64 Windows, no extra pack) ──
-        // m_pData:         offset 0   (IntPtr, 8 bytes)
-        // m_cbSize:        offset 8   (int,    4 bytes)
-        // m_conn:          offset 12  (uint,   4 bytes)
-        // m_nFlags:        offset 196 (int,    4 bytes)
-        // m_nMessageNumber:offset 168 (int64,  8 bytes)
+        // ── SteamNetworkingMessage_t field offsets ────────────────────────────────
+        // This struct is defined OUTSIDE the VALVE_CALLBACK_PACK pragma scope,
+        // so it uses default alignment which is identical on Windows and Linux x64.
+        // m_pData:          offset 0   (IntPtr, 8 bytes)
+        // m_cbSize:         offset 8   (int,    4 bytes)
+        // m_conn:           offset 12  (uint,   4 bytes)
+        // m_nMessageNumber: offset 168 (int64,  8 bytes)
+        // m_nFlags:         offset 196 (int,    4 bytes)
         internal static IntPtr  Msg_pData(IntPtr msg)          => Marshal.ReadIntPtr(msg, 0);
         internal static int     Msg_cbSize(IntPtr msg)         => Marshal.ReadInt32(msg, 8);
         internal static uint    Msg_conn(IntPtr msg)           => (uint)Marshal.ReadInt32(msg, 12);
@@ -214,15 +216,27 @@ namespace Valve.Sockets
         internal static int     Msg_flags(IntPtr msg)          => Marshal.ReadInt32(msg, 196);
 
         // ── SteamNetConnectionStatusChangedCallback_t field offsets ──────────────
-        // (pack 8 on Windows x64)
-        // m_hConn:              offset 0   (uint,   4 bytes)
-        // [padding 4]
-        // m_info.m_eState:      offset 184 (int,    4 bytes)  [8 + 176]
-        // m_info.m_eEndReason:  offset 188 (int,    4 bytes)  [8 + 180]
-        // m_info.m_szEndDebug:  offset 192 (char[], 128 bytes)[8 + 184]
-        // m_eOldState:          offset 704 (int,    4 bytes)
+        //
+        // Windows uses VALVE_CALLBACK_PACK_LARGE (pack 8):
+        //   m_hConn at 0, [4 bytes padding], m_info at 8
+        // Linux/macOS uses VALVE_CALLBACK_PACK_SMALL (pack 4):
+        //   m_hConn at 0, m_info at 4  (no padding)
+        //
+        // SteamNetConnectionInfo_t layout is identical on both platforms (696 bytes):
+        //   m_eState     at +176, m_eEndReason at +180, m_szEndDebug at +184
+        //   m_hListenSocket at +144
+        //   struct size 696 → m_eOldState follows immediately after m_info
+        //
+        // m_hConn is always at offset 0 (first field, no padding before it).
+
+        // Offset of m_info within SteamNetConnectionStatusChangedCallback_t.
+        // pack(8) on Windows adds 4 bytes of padding after m_hConn (uint32) to align
+        // SteamNetConnectionInfo_t to 8 bytes (it contains int64 fields).
+        private static readonly int _cbInfoOffset =
+            RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? 8 : 4;
+
         // ── SteamNetConnectionInfo_t field offsets ────────────────────────────────
-        // m_hListenSocket: offset 144 (uint, 4 bytes)
+        // m_hListenSocket: offset 144 (uint, 4 bytes) — same on all platforms
         internal static uint GetConnectionListenSocket(IntPtr iface, uint hConn)
         {
             IntPtr buf = Marshal.AllocHGlobal(700); // 696 bytes + 4 bytes padding to avoid any potential overread
@@ -237,10 +251,10 @@ namespace Valve.Sockets
             }
         }
 
-        internal static uint           Cb_hConn(IntPtr p)      => (uint)Marshal.ReadInt32(p, 0);
-        internal static ConnectionState Cb_eState(IntPtr p)    => (ConnectionState)Marshal.ReadInt32(p, 184);
-        internal static int            Cb_endReason(IntPtr p)  => Marshal.ReadInt32(p, 188);
-        internal static ConnectionState Cb_eOldState(IntPtr p) => (ConnectionState)Marshal.ReadInt32(p, 704);
-        internal static string         Cb_endDebug(IntPtr p)   => Marshal.PtrToStringAnsi(p + 192) ?? "";
+        internal static uint            Cb_hConn(IntPtr p)     => (uint)Marshal.ReadInt32(p, 0);
+        internal static ConnectionState Cb_eState(IntPtr p)    => (ConnectionState)Marshal.ReadInt32(p, _cbInfoOffset + 176);
+        internal static int             Cb_endReason(IntPtr p) => Marshal.ReadInt32(p, _cbInfoOffset + 180);
+        internal static ConnectionState Cb_eOldState(IntPtr p) => (ConnectionState)Marshal.ReadInt32(p, _cbInfoOffset + 696);
+        internal static string          Cb_endDebug(IntPtr p)  => Marshal.PtrToStringAnsi(p + _cbInfoOffset + 184) ?? "";
     }
 }
