@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 
-namespace Valve.Sockets
+namespace GameNetworkingSockets
 {
     /// <summary>GNS server socket. Listens for incoming connections and manages connected clients via a poll group.</summary>
     public class NetworkingServer : NetworkingSockets
@@ -82,7 +82,7 @@ namespace Valve.Sockets
         /// <summary>Sends data to all currently connected clients.</summary>
         public void Broadcast(byte[] data, SendType sendType = SendType.Reliable)
         {
-            foreach (uint hConn in _clients)
+            foreach (uint hConn in _clients.ToArray())
                 SendMessage(hConn, data, sendType);
         }
 
@@ -94,7 +94,7 @@ namespace Valve.Sockets
 
         public override void Dispose()
         {
-            foreach (uint hConn in _clients)
+            foreach (uint hConn in _clients.ToArray())
                 CloseConnection(hConn);
             _clients.Clear();
 

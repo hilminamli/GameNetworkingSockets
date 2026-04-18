@@ -2,7 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.Text;
 
-namespace Valve.Sockets
+namespace GameNetworkingSockets
 {
     /// <summary>Base class for GNS socket wrappers. Handles send, receive, connection management, and real-time stats.</summary>
     public abstract class NetworkingSockets : IDisposable

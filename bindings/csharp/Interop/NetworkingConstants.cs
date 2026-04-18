@@ -1,4 +1,4 @@
-namespace Valve.Sockets
+namespace GameNetworkingSockets
 {
     /// <summary>Compile-time constants for native interop buffer and struct sizes.</summary>
     internal static class NetworkingConstants

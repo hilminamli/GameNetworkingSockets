@@ -1,7 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 
-namespace Valve.Sockets
+namespace GameNetworkingSockets
 {
     /// <summary>Operation result codes returned by GNS send/accept calls. Note: OK = 1, not 0.</summary>
     public enum EResult : int

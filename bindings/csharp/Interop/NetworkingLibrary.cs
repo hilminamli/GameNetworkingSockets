@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 
-namespace Valve.Sockets
+namespace GameNetworkingSockets
 {
     /// <summary>Manages GNS library lifetime and routes connection status callbacks to the owning socket instance.</summary>
     public static class NetworkingLibrary

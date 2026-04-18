@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyName>GameNetworkingSockets.CSharp</AssemblyName>
+    <RootNamespace>GameNetworkingSockets</RootNamespace>
+    <Nullable>disable</Nullable>
+    <DebugType>embedded</DebugType>
+    <NoWarn>1591</NoWarn>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+
+    <PackageId>GameNetworkingSockets.CSharp</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Throwia</Authors>
+    <Description>C# bindings for GameNetworkingSockets — Interop and Transport layers.</Description>
+  </PropertyGroup>
+
+</Project>

@@ -65,3 +65,5 @@ src/common/*.pb.h
 
 # Protobuf has some test scripts and we get warnings about line endings
 src/external/protobuf-3.15.3/**/*.sh
+bindings/csharp/bin/
+bindings/csharp/obj/

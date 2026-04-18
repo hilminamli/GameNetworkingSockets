@@ -1,12 +1,13 @@
 using System;
 
-namespace Valve.Sockets
+namespace GameNetworkingSockets
 {
     /// <summary>GNS client socket. Connects to a remote server and handles send/receive for a single connection.</summary>
     public class NetworkingClient : NetworkingSockets
     {
         /// <summary>GNS connection handle. Zero when not connected.</summary>
         public uint Connection  { get; private set; }
+        /// <summary>True when the connection is in Connected state.</summary>
         public bool IsConnected { get; private set; }
 
         /// <summary>Fired when the connection reaches Connected state.</summary>

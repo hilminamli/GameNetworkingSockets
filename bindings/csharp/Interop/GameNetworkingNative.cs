@@ -1,7 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 
-namespace Valve.Sockets
+namespace GameNetworkingSockets
 {
     /// <summary>P/Invoke declarations and raw struct field accessors for the GameNetworkingSockets native library.</summary>
     internal static class Native
