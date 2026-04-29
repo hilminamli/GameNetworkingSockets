@@ -11,9 +11,22 @@ namespace GameNetworkingSockets
         public bool IsConnected { get; private set; }
 
         /// <summary>Fired when the connection reaches Connected state.</summary>
-        public event Action?              OnConnected;
+        public event Action               OnConnected;
         /// <summary>Fired on disconnect. Params: endReason, endDebug.</summary>
-        public event Action<int, string>? OnDisconnected;
+        public event Action<int, string>  OnDisconnected;
+
+        // ── Construction ─────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Creates a client socket. Connect with <see cref="Connect(string)"/> or <see cref="Connect(ref SteamNetworkingIPAddr)"/>.
+        /// </summary>
+        /// <param name="messageBufferSize">
+        /// Max messages drained per <see cref="ReceiveMessages"/> call. Defaults to
+        /// <see cref="NetworkingConstants.DefaultClientMessageBufferSize"/>. Increase if the server pushes
+        /// large bursts (e.g. world snapshots) and a single tick should drain more of them at once.
+        /// </param>
+        public NetworkingClient(int messageBufferSize = NetworkingConstants.DefaultClientMessageBufferSize)
+            : base(messageBufferSize) { }
 
         // ── Dispatcher hooks ─────────────────────────────────────────────────────
 
@@ -32,8 +45,17 @@ namespace GameNetworkingSockets
                 case ConnectionState.ClosedByPeer:
                 case ConnectionState.ProblemDetectedLocally:
                     IsConnected = false;
-                    Connection  = 0;
                     OnDisconnected?.Invoke(info.endReason, info.endDebug);
+                    // GNS contract: connection is already closed on the wire, but the handle
+                    // still holds local resources until CloseConnection is called.
+                    _ = CloseConnection(info.connection);
+                    Connection = 0;
+                    break;
+
+                case ConnectionState.None:
+                case ConnectionState.Connecting:
+                case ConnectionState.FindingRoute:
+                default:
                     break;
             }
         }
@@ -60,7 +82,7 @@ namespace GameNetworkingSockets
         }
 
         /// <summary>Closes the active connection and resets connection state.</summary>
-        public bool Disconnect(int reason = 0, string? debug = null)
+        public bool Disconnect(int reason = 0, string debug = null)
         {
             if (Connection == 0) return false;
 
@@ -71,18 +93,18 @@ namespace GameNetworkingSockets
         }
 
         /// <summary>Sends data to the active server connection.</summary>
-        public EResult SendMessage(byte[] data, SendType sendType = SendType.Reliable)
+        public EResult SendMessage(ReadOnlySpan<byte> data, SendType sendType = SendType.Reliable)
             => SendMessage(Connection, data, sendType);
 
-        /// <summary>Receives pending messages from the server into the provided buffer.</summary>
-        public int ReceiveMessages(NetworkMessage[] messages)
-            => ReceiveMessages(Connection, messages);
+        /// <summary>Receives pending messages from the server and dispatches each to the callback.</summary>
+        public int ReceiveMessages(MessageReceivedCallback receiver)
+            => ReceiveMessages(Connection, receiver);
 
         // ── IDisposable ──────────────────────────────────────────────────────────
 
         public override void Dispose()
         {
-            Disconnect();
+            _ = Disconnect();
             base.Dispose(); // sets _disposed, unregisters from library
         }
 
@@ -90,7 +112,7 @@ namespace GameNetworkingSockets
         {
             // Dispose was not called — clean up native connection
             if (Connection != 0 && NetworkingLibrary.IsInitialized)
-                Native.SteamAPI_ISteamNetworkingSockets_CloseConnection(_iface, Connection, 0, null, false);
+                _ = Native.SteamAPI_ISteamNetworkingSockets_CloseConnection(_iface, Connection, 0, null, false);
         }
     }
 }

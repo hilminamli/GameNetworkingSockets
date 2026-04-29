@@ -11,7 +11,7 @@ namespace GameNetworkingSockets.Transport
         public string Id { get; }
         public bool IsConnected { get; private set; } = true;
 
-        public event Action<byte[]> OnMessage;
+        public event MessageHandler OnMessage;
         public event Action OnDisconnected;
 
         internal ServerConnection(uint hConn, ServerTransport transport)
@@ -21,7 +21,7 @@ namespace GameNetworkingSockets.Transport
             Id         = hConn.ToString();
         }
 
-        public void Send(byte[] data, SendType sendType = SendType.Reliable)
+        public void Send(ReadOnlySpan<byte> data, SendType sendType = SendType.Reliable)
             => _transport.SendTo(_hConn, data, sendType);
 
         public void Disconnect()
@@ -33,7 +33,8 @@ namespace GameNetworkingSockets.Transport
         public bool GetConnectionStatus(out int pingMs, out float packetLoss)
             => _transport.GetConnectionStatus(_hConn, out pingMs, out packetLoss);
 
-        internal void DispatchMessage(byte[] data) => OnMessage?.Invoke(data);
+        internal void DispatchMessage(ReadOnlySpan<byte> data)
+            => OnMessage?.Invoke(data);
 
         internal void NotifyDisconnected()
         {

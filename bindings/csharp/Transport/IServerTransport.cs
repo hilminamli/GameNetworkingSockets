@@ -20,7 +20,7 @@ namespace GameNetworkingSockets.Transport
         /// <summary>Fired when a client disconnects.</summary>
         event Action<IConnection> OnDisconnected;
 
-        /// <summary>Sends data to all connected clients.</summary>
-        void Broadcast(byte[] data, SendType sendType = SendType.Reliable);
+        /// <summary>Sends data to all connected clients. Zero allocation.</summary>
+        void Broadcast(ReadOnlySpan<byte> data, SendType sendType = SendType.Reliable);
     }
 }

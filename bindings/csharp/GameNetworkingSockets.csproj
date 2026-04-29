@@ -5,15 +5,28 @@
     <AssemblyName>GameNetworkingSockets.CSharp</AssemblyName>
     <RootNamespace>GameNetworkingSockets</RootNamespace>
     <Nullable>disable</Nullable>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisMode>All</AnalysisMode>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
     <DebugType>embedded</DebugType>
     <NoWarn>1591</NoWarn>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
 
     <PackageId>GameNetworkingSockets.CSharp</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.5.0</Version>
     <Authors>Throwia</Authors>
     <Description>C# bindings for GameNetworkingSockets — Interop and Transport layers.</Description>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="Tests\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="native/win-x64/GameNetworkingSockets.dll" Pack="true" PackagePath="runtimes/win-x64/native/" />
+    <None Include="native/linux-x64/libGameNetworkingSockets.so" Pack="true" PackagePath="runtimes/linux-x64/native/" />
+    <None Include="build/GameNetworkingSockets.CSharp.targets" Pack="true" PackagePath="build/" />
+  </ItemGroup>
 
 </Project>

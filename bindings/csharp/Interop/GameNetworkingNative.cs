@@ -53,7 +53,7 @@ namespace GameNetworkingSockets
             IntPtr self,
             uint hPeer,
             int nReason,
-            [MarshalAs(UnmanagedType.LPStr)] string? pszDebug,
+            [MarshalAs(UnmanagedType.LPStr)] string pszDebug,
             [MarshalAs(UnmanagedType.I1)] bool bEnableLinger);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -66,10 +66,17 @@ namespace GameNetworkingSockets
         internal static extern int SteamAPI_ISteamNetworkingSockets_SendMessageToConnection(
             IntPtr self,
             uint hConn,
-            byte[] pData,
+            IntPtr pData,
             uint cbData,
             int nSendFlags,
             out long pOutMessageNumber);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void SteamAPI_ISteamNetworkingSockets_SendMessages(
+            IntPtr self,
+            int nMessages,
+            IntPtr[] ppMessages,
+            IntPtr pOutMessageNumberOrResult); // IntPtr.Zero = ignore per-message results
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnConnection(
@@ -152,6 +159,18 @@ namespace GameNetworkingSockets
             IntPtr self,
             FnConnectionStatusChanged fnCallback);
 
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr SteamAPI_ISteamNetworkingUtils_AllocateMessage(
+            IntPtr self,
+            int cbAllocateBuffer);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        internal static extern bool SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueInt32(
+            IntPtr self,
+            int eValue,
+            int val);
+
         // ── SteamNetworkingIPAddr flat helpers ────────────────────────────────────
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -174,6 +193,13 @@ namespace GameNetworkingSockets
         internal static extern void SteamAPI_SteamNetworkingIPAddr_ToString(
             ref SteamNetworkingIPAddr self,
             byte[] buf,
+            UIntPtr cbBuf,
+            [MarshalAs(UnmanagedType.I1)] bool bWithPort);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern unsafe void SteamAPI_SteamNetworkingIPAddr_ToString(
+            ref SteamNetworkingIPAddr self,
+            byte* buf,
             UIntPtr cbBuf,
             [MarshalAs(UnmanagedType.I1)] bool bWithPort);
 
@@ -201,19 +227,22 @@ namespace GameNetworkingSockets
         internal static extern void SteamAPI_SteamNetworkingMessage_t_Release(
             IntPtr self);
 
-        // ── SteamNetworkingMessage_t field offsets ────────────────────────────────
-        // This struct is defined OUTSIDE the VALVE_CALLBACK_PACK pragma scope,
-        // so it uses default alignment which is identical on Windows and Linux x64.
+        // ── SteamNetworkingMessage_t ──────────────────────────────────────────────
+        // Defined outside VALVE_CALLBACK_PACK — default alignment, identical on Windows and Linux x64.
         // m_pData:          offset 0   (IntPtr, 8 bytes)
         // m_cbSize:         offset 8   (int,    4 bytes)
         // m_conn:           offset 12  (uint,   4 bytes)
         // m_nMessageNumber: offset 168 (int64,  8 bytes)
         // m_nFlags:         offset 196 (int,    4 bytes)
-        internal static IntPtr  Msg_pData(IntPtr msg)          => Marshal.ReadIntPtr(msg, 0);
-        internal static int     Msg_cbSize(IntPtr msg)         => Marshal.ReadInt32(msg, 8);
-        internal static uint    Msg_conn(IntPtr msg)           => (uint)Marshal.ReadInt32(msg, 12);
-        internal static long    Msg_messageNumber(IntPtr msg)  => Marshal.ReadInt64(msg, 168);
-        internal static int     Msg_flags(IntPtr msg)          => Marshal.ReadInt32(msg, 196);
+        [StructLayout(LayoutKind.Explicit)]
+        internal unsafe struct SteamNetworkingMessage_t
+        {
+            [FieldOffset(0)]   public IntPtr pData;
+            [FieldOffset(8)]   public int    cbSize;
+            [FieldOffset(12)]  public uint   conn;
+            [FieldOffset(168)] public long   messageNumber;
+            [FieldOffset(196)] public int    flags;
+        }
 
         // ── SteamNetConnectionStatusChangedCallback_t field offsets ──────────────
         //
@@ -237,24 +266,26 @@ namespace GameNetworkingSockets
 
         // ── SteamNetConnectionInfo_t field offsets ────────────────────────────────
         // m_hListenSocket: offset 144 (uint, 4 bytes) — same on all platforms
-        internal static uint GetConnectionListenSocket(IntPtr iface, uint hConn)
+        internal static unsafe uint GetConnectionListenSocket(IntPtr iface, uint hConn)
         {
-            IntPtr buf = Marshal.AllocHGlobal(700); // 696 bytes + 4 bytes padding to avoid any potential overread
-            try
-            {
-                SteamAPI_ISteamNetworkingSockets_GetConnectionInfo(iface, hConn, buf);
-                return (uint)Marshal.ReadInt32(buf, 144);
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(buf);
-            }
+            byte* buf = stackalloc byte[700]; // 696 bytes + 4 padding to avoid overread
+            _ = SteamAPI_ISteamNetworkingSockets_GetConnectionInfo(iface, hConn, (IntPtr)buf);
+            return *(uint*)(buf + 144);
         }
 
         internal static uint            Cb_hConn(IntPtr p)     => (uint)Marshal.ReadInt32(p, 0);
         internal static ConnectionState Cb_eState(IntPtr p)    => (ConnectionState)Marshal.ReadInt32(p, _cbInfoOffset + 176);
         internal static int             Cb_endReason(IntPtr p) => Marshal.ReadInt32(p, _cbInfoOffset + 180);
         internal static ConnectionState Cb_eOldState(IntPtr p) => (ConnectionState)Marshal.ReadInt32(p, _cbInfoOffset + 696);
-        internal static string          Cb_endDebug(IntPtr p)  => Marshal.PtrToStringAnsi(p + _cbInfoOffset + 184) ?? "";
+        internal static string          Cb_endDebug(IntPtr p)  => PtrToStringUtf8(p + _cbInfoOffset + 184, 128);
+
+        // GNS emits UTF-8 strings. m_szEndDebug is a fixed 128-byte buffer (k_cchSteamNetworkingMaxConnectionCloseReason).
+        internal static unsafe string PtrToStringUtf8(IntPtr ptr, int maxLen)
+        {
+            if (ptr == IntPtr.Zero) return "";
+            var span = new ReadOnlySpan<byte>((void*)ptr, maxLen);
+            int end = span.IndexOf((byte)0);
+            return System.Text.Encoding.UTF8.GetString(end < 0 ? span : span[..end]);
+        }
     }
 }

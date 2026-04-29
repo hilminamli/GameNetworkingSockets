@@ -11,3 +11,57 @@ indent_size = 4
 [CMakeLists.txt,*.{cpp,h}]
 indent_style = tab
 indent_size = 4
+
+[*.cs]
+indent_style = space
+indent_size = 4
+
+dotnet_analyzer_diagnostic.category-Style.severity       = warning
+dotnet_analyzer_diagnostic.category-Performance.severity = warning
+dotnet_analyzer_diagnostic.category-Reliability.severity = warning
+dotnet_analyzer_diagnostic.category-Maintainability.severity = warning
+
+# Not applicable for netstandard2.1
+
+# Style preferences — suppress noise
+dotnet_diagnostic.IDE0055.severity = none   # column-aligned assignments are intentional
+dotnet_diagnostic.IDE0011.severity = none   # braces on every if — not required
+dotnet_diagnostic.IDE0022.severity = none   # expression body preference
+dotnet_diagnostic.IDE0008.severity = none   # var usage is intentional
+dotnet_diagnostic.IDE0046.severity = none   # conditional return — style only
+dotnet_diagnostic.IDE0021.severity = none   # expression body for ctor
+dotnet_diagnostic.IDE0130.severity = none   # namespace/folder mismatch — intentional flat namespace
+dotnet_diagnostic.IDE0032.severity = none   # auto property — backing fields needed
+
+# Unused members / parameters
+dotnet_diagnostic.IDE0051.severity = warning   # remove unused private member
+dotnet_diagnostic.IDE0052.severity = warning   # remove unread private member
+dotnet_diagnostic.IDE0059.severity = warning   # unnecessary assignment
+dotnet_diagnostic.IDE0060.severity = warning   # remove unused parameter
+dotnet_diagnostic.CA1801.severity  = warning   # review unused parameters
+
+# Simplifications
+dotnet_diagnostic.IDE0001.severity = warning   # simplify name
+dotnet_diagnostic.IDE0002.severity = warning   # simplify member access
+dotnet_diagnostic.IDE0004.severity = warning   # remove unnecessary cast
+dotnet_diagnostic.IDE0005.severity = warning   # remove unnecessary using
+dotnet_diagnostic.IDE0017.severity = warning   # simplify object initialization
+dotnet_diagnostic.IDE0018.severity = warning   # inline variable declaration
+dotnet_diagnostic.IDE0028.severity = warning   # simplify collection initialization
+dotnet_diagnostic.IDE0034.severity = warning   # simplify default expression
+dotnet_diagnostic.IDE0075.severity = warning   # simplify conditional expression
+dotnet_diagnostic.IDE0100.severity = warning   # remove redundant equality
+
+# Null handling
+dotnet_diagnostic.IDE0029.severity = warning   # use coalesce expression (non-nullable)
+dotnet_diagnostic.IDE0030.severity = warning   # use coalesce expression (nullable)
+dotnet_diagnostic.IDE0031.severity = warning   # use null propagation
+
+# Pattern matching
+dotnet_diagnostic.IDE0019.severity = warning   # use pattern matching (avoid is + cast)
+dotnet_diagnostic.IDE0020.severity = warning   # use pattern matching (avoid as + null check)
+dotnet_diagnostic.IDE0038.severity = warning   # use pattern matching (avoid is + direct use)
+
+# Modifiers
+dotnet_diagnostic.IDE0044.severity = warning   # add readonly modifier
+dotnet_diagnostic.CA1822.severity  = warning   # mark members as static where possible

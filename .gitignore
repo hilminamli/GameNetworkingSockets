@@ -67,3 +67,6 @@ src/common/*.pb.h
 src/external/protobuf-3.15.3/**/*.sh
 bindings/csharp/bin/
 bindings/csharp/obj/
+bindings/csharp/Tests/bin/
+bindings/csharp/Tests/obj/
+bindings/csharp/nupkg/

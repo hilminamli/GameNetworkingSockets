@@ -7,9 +7,10 @@ namespace GameNetworkingSockets.Transport
     public sealed class ServerTransport : IServerTransport
     {
         private readonly ushort _port;
+        private readonly int _messageBufferSize;
         private NetworkingServer _server;
         private readonly Dictionary<uint, ServerConnection> _connections = new Dictionary<uint, ServerConnection>();
-        private readonly NetworkMessage[] _msgBuffer = new NetworkMessage[NetworkingConstants.MessageBufferSize];
+        private readonly MessageReceivedCallback _dispatch;
 
         /// <summary>Fired when a new client connects.</summary>
         public event Action<IConnection> OnConnected;
@@ -17,12 +18,29 @@ namespace GameNetworkingSockets.Transport
         public event Action<IConnection> OnDisconnected;
 
         /// <summary>Creates a ServerTransport that will listen on the given port.</summary>
-        public ServerTransport(ushort port) => _port = port;
+        /// <param name="port">UDP port to listen on.</param>
+        /// <param name="messageBufferSize">
+        /// Max messages drained per <see cref="Tick"/> across the poll group. Defaults to
+        /// <see cref="NetworkingConstants.DefaultServerMessageBufferSize"/>. Tune up for high client counts
+        /// or burst traffic so a single tick can drain more pending messages without leaving them queued
+        /// for the next tick. Applied when <see cref="Start"/> creates the listen socket.
+        /// </param>
+        public ServerTransport(ushort port,
+            int messageBufferSize = NetworkingConstants.DefaultServerMessageBufferSize)
+        {
+            _port              = port;
+            _messageBufferSize = messageBufferSize;
+            _dispatch = (hConn, data) =>
+            {
+                if (_connections.TryGetValue(hConn, out var conn))
+                    conn.DispatchMessage(data);
+            };
+        }
 
         /// <summary>Creates the listen socket and subscribes to GNS connection events.</summary>
         public void Start()
         {
-            _server = new NetworkingServer(_port);
+            _server = new NetworkingServer(_port, _messageBufferSize);
 
             _server.OnClientConnected += hConn =>
             {
@@ -34,7 +52,7 @@ namespace GameNetworkingSockets.Transport
             _server.OnClientDisconnected += (hConn, reason, debug) =>
             {
                 if (!_connections.TryGetValue(hConn, out var conn)) return;
-                _connections.Remove(hConn);
+                _ = _connections.Remove(hConn);
                 conn.NotifyDisconnected();
                 OnDisconnected?.Invoke(conn);
             };
@@ -54,23 +72,17 @@ namespace GameNetworkingSockets.Transport
             if (_server == null) return;
 
             _server.RunCallbacks();
-
-            int count = _server.ReceiveMessages(_msgBuffer);
-            for (int i = 0; i < count; i++)
-            {
-                if (_connections.TryGetValue(_msgBuffer[i].connection, out var conn))
-                    conn.DispatchMessage(_msgBuffer[i].data);
-            }
+            _ = _server.ReceiveMessages(_dispatch);
         }
 
         /// <inheritdoc cref="Stop"/>
         public void Dispose() => Stop();
 
-        /// <summary>Sends data to all currently connected clients.</summary>
-        public void Broadcast(byte[] data, SendType sendType = SendType.Reliable)
+        /// <summary>Sends data to all currently connected clients. Zero allocation.</summary>
+        public void Broadcast(ReadOnlySpan<byte> data, SendType sendType = SendType.Reliable)
             => _server?.Broadcast(data, sendType);
 
-        internal void SendTo(uint hConn, byte[] data, SendType sendType)
+        internal void SendTo(uint hConn, ReadOnlySpan<byte> data, SendType sendType)
             => _server?.SendMessage(hConn, data, sendType);
 
         internal void Kick(uint hConn)

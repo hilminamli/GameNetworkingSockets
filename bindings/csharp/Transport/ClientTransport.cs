@@ -8,7 +8,7 @@ namespace GameNetworkingSockets.Transport
         private readonly string _address;
         private readonly ushort _port;
         private readonly NetworkingClient _client;
-        private readonly NetworkMessage[] _msgBuffer = new NetworkMessage[NetworkingConstants.MessageBufferSize];
+        private readonly MessageReceivedCallback _dispatch;
 
         /// <summary>True when the connection is in Connected state.</summary>
         public bool IsConnected => _client.IsConnected;
@@ -17,15 +17,24 @@ namespace GameNetworkingSockets.Transport
         public event Action OnConnected;
         /// <summary>Fired when the connection closes for any reason.</summary>
         public event Action OnDisconnected;
-        /// <summary>Fired for each received message with its raw payload.</summary>
-        public event Action<byte[]> OnMessage;
+        /// <summary>Fired for each received message. The span is only valid inside the handler — copy out anything you need to retain.</summary>
+        public event MessageHandler OnMessage;
 
         /// <summary>Creates a ClientTransport targeting the given address and port.</summary>
-        public ClientTransport(string address, ushort port)
+        /// <param name="address">Server hostname or IP.</param>
+        /// <param name="port">Server UDP port.</param>
+        /// <param name="messageBufferSize">
+        /// Max messages drained per <see cref="Tick"/>. Defaults to
+        /// <see cref="NetworkingConstants.DefaultClientMessageBufferSize"/>. Increase if the server pushes
+        /// large bursts (e.g. world snapshots) and a single tick should drain more of them at once.
+        /// </param>
+        public ClientTransport(string address, ushort port,
+            int messageBufferSize = NetworkingConstants.DefaultClientMessageBufferSize)
         {
-            _address = address;
-            _port    = port;
-            _client  = new NetworkingClient();
+            _address  = address;
+            _port     = port;
+            _client   = new NetworkingClient(messageBufferSize);
+            _dispatch = (_, data) => OnMessage?.Invoke(data);
 
             _client.OnConnected    += () => OnConnected?.Invoke();
             _client.OnDisconnected += (reason, debug) => OnDisconnected?.Invoke();
@@ -41,14 +50,11 @@ namespace GameNetworkingSockets.Transport
         public void Tick()
         {
             _client.RunCallbacks();
-
-            int count = _client.ReceiveMessages(_msgBuffer);
-            for (int i = 0; i < count; i++)
-                OnMessage?.Invoke(_msgBuffer[i].data);
+            _ = _client.ReceiveMessages(_dispatch);
         }
 
         /// <summary>Sends raw data to the server.</summary>
-        public void Send(byte[] data, SendType sendType = SendType.Reliable)
+        public void Send(ReadOnlySpan<byte> data, SendType sendType = SendType.Reliable)
             => _client.SendMessage(data, sendType);
 
         /// <summary>Returns ping and packet loss for the active connection. Returns false if not connected.</summary>
@@ -58,7 +64,6 @@ namespace GameNetworkingSockets.Transport
             return _client.GetConnectionStatus(_client.Connection, out pingMs, out packetLoss);
         }
 
-        /// <inheritdoc cref="Disconnect"/>
-        public void Dispose() => Disconnect();
+        public void Dispose() => _client.Dispose();
     }
 }

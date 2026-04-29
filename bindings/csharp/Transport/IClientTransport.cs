@@ -17,7 +17,7 @@ namespace GameNetworkingSockets.Transport
         void Tick();
 
         /// <summary>Sends raw bytes to the server.</summary>
-        void Send(byte[] data, SendType sendType = SendType.Reliable);
+        void Send(ReadOnlySpan<byte> data, SendType sendType = SendType.Reliable);
 
         /// <summary>Fired when the connection is established.</summary>
         event Action OnConnected;
@@ -25,8 +25,11 @@ namespace GameNetworkingSockets.Transport
         /// <summary>Fired when the connection is closed.</summary>
         event Action OnDisconnected;
 
-        /// <summary>Fired when a message is received from the server.</summary>
-        event Action<byte[]> OnMessage;
+        /// <summary>
+        /// Fired when a message is received. The span is only valid inside the handler — do not
+        /// capture it, cross an await with it, or hand it to another thread. Copy out anything you need.
+        /// </summary>
+        event MessageHandler OnMessage;
 
         /// <summary>Returns real-time connection stats. Returns false if unavailable.</summary>
         bool GetConnectionStatus(out int pingMs, out float packetLoss);
