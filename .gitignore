@@ -70,3 +70,10 @@ bindings/csharp/obj/
 bindings/csharp/Tests/bin/
 bindings/csharp/Tests/obj/
 bindings/csharp/nupkg/
+
+# Tooling local state
+.claude/
+build-linux/
+build-win-static/
+build-static/
+vcpkg_installed/

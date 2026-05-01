@@ -14,7 +14,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
 
     <PackageId>GameNetworkingSockets.CSharp</PackageId>
-    <Version>1.5.0</Version>
+    <Version>1.6.0</Version>
     <Authors>Throwia</Authors>
     <Description>C# bindings for GameNetworkingSockets — Interop and Transport layers.</Description>
   </PropertyGroup>
