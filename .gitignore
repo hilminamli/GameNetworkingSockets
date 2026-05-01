@@ -73,6 +73,7 @@ bindings/csharp/nupkg/
 
 # Tooling local state
 .claude/
+.serena/
 build-linux/
 build-win-static/
 build-static/
