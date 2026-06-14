@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>CrossTest</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\csharp\GameNetworkingSockets.csproj" />
+  </ItemGroup>
+
+  <!-- ProjectReference doesn't carry the binding's native lib; copy it to our output. -->
+  <ItemGroup>
+    <None Include="..\csharp\native\win-x64\GameNetworkingSockets.dll" Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>GameNetworkingSockets.dll</Link>
+    </None>
+    <None Include="..\csharp\native\linux-x64\libGameNetworkingSockets.so" Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>libGameNetworkingSockets.so</Link>
+    </None>
+  </ItemGroup>
+
+</Project>

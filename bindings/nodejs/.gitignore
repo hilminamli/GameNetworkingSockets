@@ -1,0 +1,7 @@
+# Dependencies and build output (all reproducible)
+node_modules/
+build/
+dist/
+*.tgz
+
+# Keep: prebuilds/ (shipped binaries), src/, src-ts/, *.json, binding.gyp, README.md, native/
