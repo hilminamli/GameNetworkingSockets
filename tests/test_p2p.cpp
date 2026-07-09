@@ -7,14 +7,23 @@
 #include <random>
 #include <chrono>
 #include <thread>
+#include <vector>
+#include <cmath>
 
 
 #include <steam/steamnetworkingsockets.h>
 #include <steam/isteamnetworkingutils.h>
 #include "../examples/trivial_signaling_client.h"
+#include "../src/steamnetworkingsockets/clientlib/steamnetworkingsockets_mock.h"
+
+#define DEFAULT_STUN_SERVER "stun.l.google.com:19302"
 
 HSteamListenSocket g_hListenSock;
 HSteamNetConnection g_hConnection;
+int g_nRepeat = 1;
+int g_nConnectionsDone = 0;
+bool g_bExpectFailure = false;  // if true, connection failure is the expected outcome
+int g_nConnectionTimeoutMS = -1; // -1 = library default
 enum ETestRole
 {
 	k_ETestRole_Undefined,
@@ -26,6 +35,80 @@ ETestRole g_eTestRole = k_ETestRole_Undefined;
 
 int g_nVirtualPortLocal = 0; // Used when listening, and when connecting
 int g_nVirtualPortRemote = 0; // Only used when connecting
+ESteamNetworkingSocketsDebugOutputType g_eTestP2PRendezvousLogLevel = k_ESteamNetworkingSocketsDebugOutputType_Verbose;
+
+// Bail on sending if total pending bytes exceed this.
+static const int k_nSendBufferLimit = 32*1024;
+
+// Number of ticks to exchange messages before the non-server side closes.
+int g_nTicks = 40; // 40 ticks * 50ms/tick = ~2 seconds
+
+// Per-connection state, reset at the start of each connection.
+bool g_bConnected = false;
+int g_nTicksDone = 0;
+int g_nSendCounterReliable = 0;
+int g_nSendCounterUnreliable = 0;
+int g_nRecvExpectedReliable = 0;
+int g_nRecvExpectedUnreliable = 0;
+
+static std::mt19937 g_rng( std::random_device{}() );
+
+void PrintUsage()
+{
+	fprintf( stderr,
+		"Usage: test_p2p [options]\n"
+		"\n"
+		"  --identity-local <identity>        Local identity string\n"
+		"  --identity-remote <identity>        Remote identity string (not needed for --server)\n"
+		"  --signaling-server <host:port>      Trivial signaling server (default: localhost:10000)\n"
+		"  --server                            Act as server (listen for connection)\n"
+		"  --client                            Act as client (connect to server)\n"
+		"  --symmetric                         Symmetric connect mode\n"
+		"  --log <file>                        Write log to file\n"
+		"  --spewlevel <level>                 Console spew level: msg, verbose, debug\n"
+		"  --loglevel-p2prendezvous <level>    P2P rendezvous log level: msg, verbose, debug\n"
+		"  --stun-server <host:port>           STUN server address (default: " DEFAULT_STUN_SERVER ")\n"
+		"  --turn-server <host:port>           TURN relay server address\n"
+		"  --turn-username <user>              TURN long-term credential username\n"
+		"  --turn-password <pass>              TURN long-term credential password\n"
+		"  --ice-implementation <n>            ICE implementation: 0=default, 1=native\n"
+		"  --repeat <n>                        Repeat the connection test N times (default: 1)\n"
+		"  --ticks <n>                         Number of 50ms send/receive ticks per connection (default: 40 = ~2s)\n"
+		"  --expect-failure                    Treat connection failure as success, success as failure\n"
+		"  --timeout-ms <n>                    Override initial connection timeout in milliseconds\n"
+		"  --signaling-loss <pct>              Drop this %% of outbound signals (0-100, default: 0)\n"
+		"  --signaling-dup <pct>               Duplicate this %% of outbound signals (0-100, default: 0)\n"
+#ifdef STEAMNETWORKINGSOCKETS_ENABLE_MOCK
+		"\n"
+		"Mock network options:\n"
+		"  --mock-adapter <ip>                 Add a mock network adapter (repeatable).\n"
+		"                                        Assigned to the most recently declared gateway,\n"
+		"                                        or public (no NAT) if no gateway declared yet.\n"
+		"  --mock-latency <ms>                 One-way send latency for the last --mock-adapter.\n"
+		"  --mock-loss <pct>                   Outbound packet loss %% for subsequently added adapters.\n"
+		"  --mock-disabled                     Mark the last --mock-adapter as down.\n"
+		"  --mock-gateway <ip>                 Declare a NAT gateway with this public IP.\n"
+		"                                        Subsequent --mock-adapters are assigned to it.\n"
+		"  --mock-nat <type>                   NAT type for last gateway: full-cone (default),\n"
+		"                                        restricted-cone, port-restricted-cone, symmetric\n"
+		"  --mock-internal-latency <ms>        VPN-tunnel latency for last gateway (host->exit).\n"
+		"  --mock-external-latency <ms>        WAN latency for last gateway (exit->internet).\n"
+#endif
+	);
+}
+
+static ESteamNetworkingSocketsDebugOutputType ParseLogLevelValue( const char *pszArg, const char *pszSwitchName )
+{
+	if ( !strcmp( pszArg, "msg" ) )
+		return k_ESteamNetworkingSocketsDebugOutputType_Msg;
+	if ( !strcmp( pszArg, "verbose" ) )
+		return k_ESteamNetworkingSocketsDebugOutputType_Verbose;
+	if ( !strcmp( pszArg, "debug" ) )
+		return k_ESteamNetworkingSocketsDebugOutputType_Debug;
+
+	TEST_Fatal( "Invalid %s '%s'. Expected one of: msg, verbose, debug", pszSwitchName, pszArg );
+	return k_ESteamNetworkingSocketsDebugOutputType_Msg;
+}
 
 void Quit( int rc )
 {
@@ -51,13 +134,110 @@ void Quit( int rc )
 	exit(rc);
 }
 
-// Send a simple string message to out peer, using reliable transport.
-void SendMessageToPeer( const char *pszMsg )
+// Print a parseable route summary for the active connection.
+// Output format: "TEST ROUTE: addr=<ip:port> type=<local|udp|relay>"
+void PrintRouteInfo()
 {
-	TEST_Printf( "Sending msg '%s'\n", pszMsg );
-	EResult r = SteamNetworkingSockets()->SendMessageToConnection(
-		g_hConnection, pszMsg, (int)strlen(pszMsg)+1, k_nSteamNetworkingSend_Reliable, nullptr );
-	assert( r == k_EResultOK );
+	SteamNetConnectionInfo_t info;
+	if ( !SteamNetworkingSockets()->GetConnectionInfo( g_hConnection, &info ) )
+		return;
+	const char *pszType;
+	if ( info.m_nFlags & k_nSteamNetworkConnectionInfoFlags_Relayed )
+		pszType = "relay";
+	else if ( info.m_nFlags & k_nSteamNetworkConnectionInfoFlags_Fast )
+		pszType = "local";
+	else
+		pszType = "udp";
+	char szAddr[64];
+	info.m_addrRemote.ToString( szAddr, sizeof(szAddr), true );
+	TEST_Printf( "TEST ROUTE: addr=%s type=%s\n", szAddr, pszType );
+}
+
+// Reset all per-connection counters.  Called at the start of each new connection.
+void ResetConnectionCounters()
+{
+	g_bConnected = false;
+	g_nTicksDone = 0;
+	g_nSendCounterReliable = 0;
+	g_nSendCounterUnreliable = 0;
+	g_nRecvExpectedReliable = 0;
+	g_nRecvExpectedUnreliable = 0;
+}
+
+// Each tick: if the send buffer is below the limit, roll 0-4 messages to send.
+// Each message is randomly reliable or unreliable, with a counter in the first
+// 4 bytes and an exponentially-distributed size (8-10k, biased toward small).
+void SendRandomMessages()
+{
+	// Bail if send buffer is already full.
+	SteamNetConnectionRealTimeStatus_t status;
+	if ( SteamNetworkingSockets()->GetConnectionRealTimeStatus( g_hConnection, &status, 0, nullptr ) != k_EResultOK )
+		return;
+	if ( status.m_cbPendingReliable + status.m_cbPendingUnreliable >= k_nSendBufferLimit )
+		return;
+
+	int nCount = std::uniform_int_distribution<int>( 0, 4 )( g_rng );
+	for ( int i = 0; i < nCount; ++i )
+	{
+		bool bReliable = std::uniform_int_distribution<int>( 0, 1 )( g_rng ) != 0;
+
+		// Exponentially distributed size from 8 to 10240 bytes, most messages small.
+		double u = std::uniform_real_distribution<double>( 0.0, 1.0 )( g_rng );
+		int nSize = 8 + (int)std::exp( u * std::log( 10232.0 ) );
+		nSize = std::min( nSize, 10240 );
+
+		// First 4 bytes are the per-channel counter; rest is uninitialized payload.
+		std::vector<uint8_t> buf( nSize );
+		int32_t nCounter = bReliable ? g_nSendCounterReliable : g_nSendCounterUnreliable;
+		memcpy( buf.data(), &nCounter, sizeof(nCounter) );
+
+		int nFlags = bReliable ? k_nSteamNetworkingSend_Reliable : k_nSteamNetworkingSend_Unreliable;
+		EResult r = SteamNetworkingSockets()->SendMessageToConnection(
+			g_hConnection, buf.data(), nSize, nFlags, nullptr );
+		if ( r != k_EResultOK )
+			break; // stop if the send fails (e.g. buffer filled mid-tick)
+
+		if ( bReliable )
+			++g_nSendCounterReliable;
+		else
+			++g_nSendCounterUnreliable;
+	}
+}
+
+// Drain all pending received messages and verify their counters.
+// Reliable counter mismatches are fatal; unreliable are expected and just logged.
+void ReceiveAndCheckMessages()
+{
+	for (;;)
+	{
+		SteamNetworkingMessage_t *pMsg = nullptr;
+		int r = SteamNetworkingSockets()->ReceiveMessagesOnConnection( g_hConnection, &pMsg, 1 );
+		assert( r == 0 || r == 1 ); // <0 indicates an error
+		if ( r == 0 )
+			break;
+
+		if ( pMsg->m_cbSize < (int)sizeof(int32_t) )
+			TEST_Fatal( "Received message too short (%d bytes)", pMsg->m_cbSize );
+
+		int32_t nCounter;
+		memcpy( &nCounter, pMsg->GetData(), sizeof(nCounter) );
+		// For received messages, only the k_nSteamNetworkingSend_Reliable bit is valid in m_nFlags.
+		bool bReliable = ( pMsg->m_nFlags & k_nSteamNetworkingSend_Reliable ) != 0;
+		pMsg->Release();
+
+		if ( bReliable )
+		{
+			if ( nCounter != g_nRecvExpectedReliable )
+				TEST_Fatal( "Reliable message counter mismatch: expected %d, got %d", g_nRecvExpectedReliable, nCounter );
+			++g_nRecvExpectedReliable;
+		}
+		else
+		{
+			if ( nCounter != g_nRecvExpectedUnreliable )
+				TEST_Printf( "Unreliable message %d arrived out of order (expected %d)\n", nCounter, g_nRecvExpectedUnreliable );
+			g_nRecvExpectedUnreliable = nCounter + 1;
+		}
+	}
 }
 
 // Called when a connection undergoes a state transition.
@@ -76,24 +256,52 @@ void OnSteamNetConnectionStatusChanged( SteamNetConnectionStatusChangedCallback_
 			pInfo->m_info.m_szEndDebug
 		);
 
-		// Close our end
-		SteamNetworkingSockets()->CloseConnection( pInfo->m_hConn, 0, nullptr, false );
-
 		if ( g_hConnection == pInfo->m_hConn )
 		{
-			g_hConnection = k_HSteamNetConnection_Invalid;
+			// Print route info before closing the handle; GetConnectionInfo won't work after.
+			// The non-server side prints this in the main loop; the server side does it here
+			// since it never initiates the close itself.
+			if ( !g_bExpectFailure && g_eTestRole == k_ETestRole_Server )
+				PrintRouteInfo();
 
-			// In this example, we will bail the test whenever this happens.
-			// Was this a normal termination?
-			int rc = 0;
-			if ( rc == k_ESteamNetworkingConnectionState_ProblemDetectedLocally || pInfo->m_info.m_eEndReason != k_ESteamNetConnectionEnd_App_Generic )
-				rc = 1; // failure
-			Quit( rc );
+			// Close our end
+			SteamNetworkingSockets()->CloseConnection( pInfo->m_hConn, 0, nullptr, false );
+			g_hConnection = k_HSteamNetConnection_Invalid;
+			g_bConnected = false;
+
+			if ( g_bExpectFailure )
+			{
+				// Connection failure is the expected outcome.
+				// ProblemDetectedLocally (or ClosedByPeer with non-app reason) = expected.
+				// ClosedByPeer with App_Generic = the peer completed successfully, which is wrong.
+				bool bUnexpectedSuccess = ( pInfo->m_info.m_eState == k_ESteamNetworkingConnectionState_ClosedByPeer )
+				                       && ( pInfo->m_info.m_eEndReason == k_ESteamNetConnectionEnd_App_Generic );
+				if ( bUnexpectedSuccess )
+				{
+					TEST_Printf( "ERROR: connection closed cleanly, but failure was expected\n" );
+					Quit( 1 );
+				}
+				TEST_Printf( "Connection failed as expected\n" );
+				SteamNetworkingSocketsLib::TEST_ICE_ctr_Print();
+			}
+			else
+			{
+				bool bError = ( pInfo->m_info.m_eState == k_ESteamNetworkingConnectionState_ProblemDetectedLocally )
+				           || ( pInfo->m_info.m_eEndReason != k_ESteamNetConnectionEnd_App_Generic );
+				if ( bError )
+					Quit( 1 );
+
+				if ( g_eTestRole == k_ETestRole_Server )
+					SteamNetworkingSocketsLib::TEST_ICE_ctr_Print();
+			}
+
+			// Clean close (or expected failure) -- main loop starts next iteration or exits.
+			++g_nConnectionsDone;
 		}
 		else
 		{
-			// Why are we hearing about any another connection?
-			assert( false );
+			// Stale handle from a previous iteration being cleaned up -- ignore.
+			SteamNetworkingSockets()->CloseConnection( pInfo->m_hConn, 0, nullptr, false );
 		}
 
 		break;
@@ -108,10 +316,19 @@ void OnSteamNetConnectionStatusChanged( SteamNetConnectionStatusChangedCallback_
 		// Is this a connection we initiated, or one that we are receiving?
 		if ( g_hListenSock != k_HSteamListenSocket_Invalid && pInfo->m_info.m_hListenSocket == g_hListenSock )
 		{
-			// Somebody's knocking
-			// Note that we assume we will only ever receive a single connection
-			assert( g_hConnection == k_HSteamNetConnection_Invalid ); // not really a bug in this code, but a bug in the test
+			// Somebody's knocking.  With --repeat, the new connection request (signaled
+			// via TCP) can race ahead of the close notification for the previous connection
+			// (sent via UDP).  If the old handle is still around, clean it up now.
+			if ( g_hConnection != k_HSteamNetConnection_Invalid )
+			{
+				TEST_Printf( "Got new connection request while previous connection was still active.  Closing previous connection\n" );
+				SteamNetworkingSockets()->CloseConnection( g_hConnection, 0, nullptr, false );
+				g_hConnection = k_HSteamNetConnection_Invalid;
+				++g_nConnectionsDone;
+			}
 
+			SteamNetworkingSocketsLib::TEST_ICE_ctr_Reset();
+			ResetConnectionCounters();
 			TEST_Printf( "[%s] Accepting\n", pInfo->m_info.m_szConnectionDescription );
 			g_hConnection = pInfo->m_hConn;
 			SteamNetworkingSockets()->AcceptConnection( pInfo->m_hConn );
@@ -135,6 +352,7 @@ void OnSteamNetConnectionStatusChanged( SteamNetConnectionStatusChangedCallback_
 		// We got fully connected
 		assert( pInfo->m_hConn == g_hConnection ); // We don't initiate or accept any other connections, so this should be out own connection
 		TEST_Printf( "[%s] connected\n", pInfo->m_info.m_szConnectionDescription );
+		g_bConnected = true;
 		break;
 
 	default:
@@ -152,6 +370,18 @@ int main( int argc, const char **argv )
 	SteamNetworkingIdentity identityLocal; identityLocal.Clear();
 	SteamNetworkingIdentity identityRemote; identityRemote.Clear();
 	const char *pszTrivialSignalingService = "localhost:10000";
+	const char *pszSTUNServer = DEFAULT_STUN_SERVER;
+	const char *pszTURNServer = nullptr;
+	const char *pszTURNUsername = nullptr;
+	const char *pszTURNPassword = nullptr;
+	int g_nICEImplementation = -1; // -1 = not set, use library default
+	int g_nICEEnable = k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_All;
+	int nSignalingLossPct = 0;
+	int nSignalingDupPct = 0;
+#ifdef STEAMNETWORKINGSOCKETS_ENABLE_MOCK
+	TEST_mocknetwork_config_t mockConfig;
+	int nCurrentMockLoss = 0; // applied to subsequently added adapters
+#endif
 
 	// Parse the command line
 	for ( int idxArg = 1 ; idxArg < argc ; ++idxArg )
@@ -175,6 +405,30 @@ int main( int argc, const char **argv )
 			ParseIdentity( identityRemote );
 		else if ( !strcmp( pszSwitch, "--signaling-server" ) )
 			pszTrivialSignalingService = GetArg();
+		else if ( !strcmp( pszSwitch, "--stun-server" ) )
+			pszSTUNServer = GetArg();
+		else if ( !strcmp( pszSwitch, "--turn-server" ) )
+			pszTURNServer = GetArg();
+		else if ( !strcmp( pszSwitch, "--turn-username" ) )
+			pszTURNUsername = GetArg();
+		else if ( !strcmp( pszSwitch, "--turn-password" ) )
+			pszTURNPassword = GetArg();
+		else if ( !strcmp( pszSwitch, "--ice-implementation" ) )
+			g_nICEImplementation = atoi( GetArg() );
+		else if ( !strcmp( pszSwitch, "--ice-enable" ) )
+			g_nICEEnable = atoi( GetArg() );
+		else if ( !strcmp( pszSwitch, "--repeat" ) )
+			g_nRepeat = atoi( GetArg() );
+		else if ( !strcmp( pszSwitch, "--ticks" ) )
+			g_nTicks = atoi( GetArg() );
+		else if ( !strcmp( pszSwitch, "--expect-failure" ) )
+			g_bExpectFailure = true;
+		else if ( !strcmp( pszSwitch, "--timeout-ms" ) )
+			g_nConnectionTimeoutMS = atoi( GetArg() );
+		else if ( !strcmp( pszSwitch, "--signaling-loss" ) )
+			nSignalingLossPct = atoi( GetArg() );
+		else if ( !strcmp( pszSwitch, "--signaling-dup" ) )
+			nSignalingDupPct = atoi( GetArg() );
 		else if ( !strcmp( pszSwitch, "--client" ) )
 			g_eTestRole = k_ETestRole_Client;
 		else if ( !strcmp( pszSwitch, "--server" ) )
@@ -185,6 +439,97 @@ int main( int argc, const char **argv )
 		{
 			const char *pszArg = GetArg();
 			TEST_InitLog( pszArg );
+		}
+		else if ( !strcmp( pszSwitch, "--spewlevel" ) || !strncmp( pszSwitch, "--spewlevel=", 12 ) )
+		{
+			const char *pszArg = pszSwitch[11] == '=' ? pszSwitch + 12 : GetArg();
+			ESteamNetworkingSocketsDebugOutputType eLogLevel = ParseLogLevelValue( pszArg, "--spewlevel" );
+			TEST_SetStdoutDetailLevel( eLogLevel );
+		}
+		else if ( !strcmp( pszSwitch, "--loglevel-p2prendezvous" ) || !strncmp( pszSwitch, "--loglevel-p2prendezvous=", 25 ) )
+		{
+			const char *pszArg = pszSwitch[24] == '=' ? pszSwitch + 25 : GetArg();
+			g_eTestP2PRendezvousLogLevel = ParseLogLevelValue( pszArg, "--loglevel-p2prendezvous" );
+		}
+#ifdef STEAMNETWORKINGSOCKETS_ENABLE_MOCK
+		else if ( !strcmp( pszSwitch, "--mock-gateway" ) )
+		{
+			const char *pszArg = GetArg();
+			TEST_mocknetwork_gateway_t gw;
+			if ( !gw.m_public_ip.ParseString( pszArg ) )
+				TEST_Fatal( "'%s' is not a valid IP address for --mock-gateway", pszArg );
+			gw.m_public_ip.m_port = 0;
+			mockConfig.m_vecGateways.push_back( gw );
+		}
+		else if ( !strcmp( pszSwitch, "--mock-nat" ) )
+		{
+			if ( mockConfig.m_vecGateways.empty() )
+				TEST_Fatal( "--mock-nat must follow --mock-gateway" );
+			const char *pszArg = GetArg();
+			TEST_mocknetwork_nat_type eNATType;
+			if ( !strcmp( pszArg, "full-cone" ) )
+				eNATType = TEST_mocknetwork_nat_type::FullCone;
+			else if ( !strcmp( pszArg, "restricted-cone" ) )
+				eNATType = TEST_mocknetwork_nat_type::RestrictedCone;
+			else if ( !strcmp( pszArg, "port-restricted-cone" ) )
+				eNATType = TEST_mocknetwork_nat_type::PortRestrictedCone;
+			else if ( !strcmp( pszArg, "symmetric" ) )
+				eNATType = TEST_mocknetwork_nat_type::Symmetric;
+			else
+				TEST_Fatal( "Invalid --mock-nat '%s'. Expected: full-cone, restricted-cone, port-restricted-cone, symmetric", pszArg );
+			mockConfig.m_vecGateways.back().m_natType = eNATType;
+		}
+		else if ( !strcmp( pszSwitch, "--mock-internal-latency" ) )
+		{
+			if ( mockConfig.m_vecGateways.empty() )
+				TEST_Fatal( "--mock-internal-latency must follow --mock-gateway" );
+			mockConfig.m_vecGateways.back().m_nInternalLatencyMS = atoi( GetArg() );
+		}
+		else if ( !strcmp( pszSwitch, "--mock-external-latency" ) )
+		{
+			if ( mockConfig.m_vecGateways.empty() )
+				TEST_Fatal( "--mock-external-latency must follow --mock-gateway" );
+			mockConfig.m_vecGateways.back().m_nExternalLatencyMS = atoi( GetArg() );
+		}
+		else if ( !strcmp( pszSwitch, "--mock-adapter" ) )
+		{
+			const char *pszArg = GetArg();
+			TEST_mocknetwork_interface_t iface;
+			if ( !iface.m_ip.ParseString( pszArg ) )
+				TEST_Fatal( "'%s' is not a valid IP address for --mock-adapter", pszArg );
+			iface.m_ip.m_port = 0;
+			iface.m_iGateway = mockConfig.m_vecGateways.empty() ? -1 : (int)mockConfig.m_vecGateways.size() - 1;
+			if ( iface.m_iGateway >= 0 )
+			{
+				const SteamNetworkingIPAddr &gwIP = mockConfig.m_vecGateways[ iface.m_iGateway ].m_public_ip;
+				if ( iface.m_ip.IsIPv4() != gwIP.IsIPv4() )
+					TEST_Fatal( "--mock-adapter '%s' address family does not match its gateway '%s'",
+						pszArg, SteamNetworkingIPAddrRender( gwIP, false ).c_str() );
+			}
+			iface.m_nSendLossPct = nCurrentMockLoss;
+			mockConfig.m_vecInterfaces.push_back( iface );
+		}
+		else if ( !strcmp( pszSwitch, "--mock-latency" ) )
+		{
+			if ( mockConfig.m_vecInterfaces.empty() )
+				TEST_Fatal( "--mock-latency must follow --mock-adapter" );
+			mockConfig.m_vecInterfaces.back().m_nSendLatencyMS = atoi( GetArg() );
+		}
+		else if ( !strcmp( pszSwitch, "--mock-loss" ) )
+		{
+			nCurrentMockLoss = atoi( GetArg() );
+		}
+		else if ( !strcmp( pszSwitch, "--mock-disabled" ) )
+		{
+			if ( mockConfig.m_vecInterfaces.empty() )
+				TEST_Fatal( "--mock-disabled must follow --mock-adapter" );
+			mockConfig.m_vecInterfaces.back().m_bEnabled = false;
+		}
+#endif
+		else if ( !strcmp( pszSwitch, "--help" ) || !strcmp( pszSwitch, "-h" ) )
+		{
+			PrintUsage();
+			exit(0);
 		}
 		else
 			TEST_Fatal( "Unexpected command line argument '%s'", pszSwitch );
@@ -197,39 +542,39 @@ int main( int argc, const char **argv )
 	if ( identityRemote.IsInvalid() && g_eTestRole != k_ETestRole_Server )
 		TEST_Fatal( "Must specify remote identity using --identity-remote" );
 
+#ifdef STEAMNETWORKINGSOCKETS_ENABLE_MOCK
+	if ( !mockConfig.m_vecInterfaces.empty() )
+		TEST_mocknetwork_init( mockConfig );
+#endif
+
 	// Initialize library, with the desired local identity
 	TEST_Init( &identityLocal );
 
-	// Hardcode STUN servers
-	SteamNetworkingUtils()->SetGlobalConfigValueString( k_ESteamNetworkingConfig_P2P_STUN_ServerList, "stun.l.google.com:19302" );
+	if ( g_nConnectionTimeoutMS > 0 )
+		SteamNetworkingUtils()->SetGlobalConfigValueInt32( k_ESteamNetworkingConfig_TimeoutInitial, g_nConnectionTimeoutMS );
 
-	// Hardcode TURN servers
-	// comma seperated setting lists
-	//const char* turnList = "turn:123.45.45:3478";
-	//const char* userList = "username";
-	//const char* passList = "pass";
+	SteamNetworkingUtils()->SetGlobalConfigValueString( k_ESteamNetworkingConfig_P2P_STUN_ServerList, pszSTUNServer );
+	if ( pszTURNServer != nullptr )
+		SteamNetworkingUtils()->SetGlobalConfigValueString( k_ESteamNetworkingConfig_P2P_TURN_ServerList, pszTURNServer );
+	if ( pszTURNUsername != nullptr )
+		SteamNetworkingUtils()->SetGlobalConfigValueString( k_ESteamNetworkingConfig_P2P_TURN_UserList, pszTURNUsername );
+	if ( pszTURNPassword != nullptr )
+		SteamNetworkingUtils()->SetGlobalConfigValueString( k_ESteamNetworkingConfig_P2P_TURN_PassList, pszTURNPassword );
+	if ( g_nICEImplementation >= 0 )
+		SteamNetworkingUtils()->SetGlobalConfigValueInt32( k_ESteamNetworkingConfig_P2P_Transport_ICE_Implementation, g_nICEImplementation );
 
-	//SteamNetworkingUtils()->SetGlobalConfigValueString(k_ESteamNetworkingConfig_P2P_TURN_ServerList, turnList);
-	//SteamNetworkingUtils()->SetGlobalConfigValueString(k_ESteamNetworkingConfig_P2P_TURN_UserList, userList);
-	//SteamNetworkingUtils()->SetGlobalConfigValueString(k_ESteamNetworkingConfig_P2P_TURN_PassList, passList);
-
-	// Allow sharing of any kind of ICE address.
-	// We don't have any method of relaying (TURN) in this example, so we are essentially
-	// forced to disclose our public address if we want to pierce NAT.  But if we
-	// had relay fallback, or if we only wanted to connect on the LAN, we could restrict
-	// to only sharing private addresses.
-	SteamNetworkingUtils()->SetGlobalConfigValueInt32(k_ESteamNetworkingConfig_P2P_Transport_ICE_Enable, k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_All );
+	SteamNetworkingUtils()->SetGlobalConfigValueInt32( k_ESteamNetworkingConfig_P2P_Transport_ICE_Enable, g_nICEEnable );
 
 	// Create the signaling service
 	SteamNetworkingErrMsg errMsg;
-	ITrivialSignalingClient *pSignaling = CreateTrivialSignalingClient( pszTrivialSignalingService, SteamNetworkingSockets(), errMsg );
+	ITrivialSignalingClient *pSignaling = CreateTrivialSignalingClient( pszTrivialSignalingService, SteamNetworkingSockets(), errMsg, nSignalingLossPct, nSignalingDupPct );
 	if ( pSignaling == nullptr )
 		TEST_Fatal( "Failed to initializing signaling client.  %s", errMsg );
 
 	SteamNetworkingUtils()->SetGlobalCallback_SteamNetConnectionStatusChanged( OnSteamNetConnectionStatusChanged );
 
 	// Comment this line in for more detailed spew about signals, route finding, ICE, etc
-	SteamNetworkingUtils()->SetGlobalConfigValueInt32( k_ESteamNetworkingConfig_LogLevel_P2PRendezvous, k_ESteamNetworkingSocketsDebugOutputType_Verbose );
+	SteamNetworkingUtils()->SetGlobalConfigValueInt32( k_ESteamNetworkingConfig_LogLevel_P2PRendezvous, g_eTestP2PRendezvousLogLevel );
 
 	// Create listen socket to receive connections on, unless we are the client
 	if ( g_eTestRole == k_ETestRole_Server )
@@ -261,9 +606,11 @@ int main( int argc, const char **argv )
 		assert( g_hListenSock != k_HSteamListenSocket_Invalid  );
 	}
 
-	// Begin connecting to peer, unless we are the server
-	if ( g_eTestRole != k_ETestRole_Server )
+	// Lambda to initiate a new outbound connection.
+	auto ConnectToPeer = [&]()
 	{
+		SteamNetworkingSocketsLib::TEST_ICE_ctr_Reset();
+		ResetConnectionCounters();
 		std::vector< SteamNetworkingConfigValue_t > vecOpts;
 
 		// If we want the local and virtual port to differ, we must set
@@ -312,58 +659,82 @@ int main( int argc, const char **argv )
 		assert( pConnSignaling );
 		g_hConnection = SteamNetworkingSockets()->ConnectP2PCustomSignaling( pConnSignaling, &identityRemote, g_nVirtualPortRemote, (int)vecOpts.size(), vecOpts.data() );
 		assert( g_hConnection != k_HSteamNetConnection_Invalid );
+	};
 
-		// Go ahead and send a message now.  The message will be queued until route finding
-		// completes.
-		SendMessageToPeer( "Greetings!" );
-	}
+	// Begin connecting to peer, unless we are the server
+	if ( g_eTestRole != k_ETestRole_Server )
+		ConnectToPeer();
 
 	// Main test loop
 	for (;;)
 	{
+		auto tickStart = std::chrono::steady_clock::now();
+
 		// Check for incoming signals, and dispatch them
 		pSignaling->Poll();
 
 		// Check callbacks
 		TEST_PumpCallbacks();
 
-		// If we have a connection, then poll it for messages
-		if ( g_hConnection != k_HSteamNetConnection_Invalid )
+		// If we have a fully connected connection, exchange messages this tick.
+		if ( g_bConnected && g_hConnection != k_HSteamNetConnection_Invalid )
 		{
-			SteamNetworkingMessage_t *pMessage;
-			int r = SteamNetworkingSockets()->ReceiveMessagesOnConnection( g_hConnection, &pMessage, 1 );
-			assert( r == 0 || r == 1 ); // <0 indicates an error
-			if ( r == 1 )
+			if ( g_bExpectFailure )
 			{
-				// In this example code we will assume all messages are '\0'-terminated strings.
-				// Obviously, this is not secure.
-				TEST_Printf( "Received message '%s'\n", pMessage->GetData() );
-
-				// Free message struct and buffer.
-				pMessage->Release();
-
-				// If we're the client, go ahead and shut down.  In this example we just
-				// wanted to establish a connection and exchange a message, and we've done that.
-				// Note that we use "linger" functionality.  This flushes out any remaining
-				// messages that we have queued.  Essentially to us, the connection is closed,
-				// but on thew wire, we will not actually close it until all reliable messages
-				// have been confirmed as received by the client.  (Or the connection is closed
-				// by the peer or drops.)  If we are the "client" role, then we know that no such
-				// messages are in the pipeline in this test.  But in symmetric mode, it is
-				// possible that we need to flush out our message that we sent.
-				if ( g_eTestRole != k_ETestRole_Server )
-				{
-					TEST_Printf( "Closing connection and shutting down.\n" );
-					SteamNetworkingSockets()->CloseConnection( g_hConnection, 0, "Test completed OK", true );
-					break;
-				}
-
-				// We're the server.  Send a reply.
-				SendMessageToPeer( "I got your message" );
+				TEST_Printf( "ERROR: received a message but connection failure was expected\n" );
+				Quit( 1 );
 			}
+
+			ReceiveAndCheckMessages();
+			SendRandomMessages();
+
+			++g_nTicksDone;
+
+			// Non-server side drives the close after the target number of ticks.
+			if ( g_eTestRole != k_ETestRole_Server && g_nTicksDone >= g_nTicks )
+			{
+				PrintRouteInfo();
+				SteamNetworkingSocketsLib::TEST_ICE_ctr_Print();
+				TEST_Printf( "Closing connection after %d ticks (%d reliable, %d unreliable sent)\n",
+					g_nTicksDone, g_nSendCounterReliable, g_nSendCounterUnreliable );
+
+				// Close with linger so the server has time to receive any messages
+				// we queued before the close notice arrives.
+				SteamNetworkingSockets()->CloseConnection( g_hConnection, k_ESteamNetConnectionEnd_App_Generic, "Test completed OK", true );
+				g_hConnection = k_HSteamNetConnection_Invalid;
+				g_bConnected = false;
+				++g_nConnectionsDone;
+				if ( g_nConnectionsDone >= g_nRepeat )
+					break;
+				TEST_Printf( "Starting next iteration\n" );
+				ConnectToPeer();
+			}
+		}
+
+		// Exit once all expected connections are done.
+		// For the server, this means N accepted+closed connections.
+		// For the client, normal exits happen inside the message handler above, but
+		// when --expect-failure is set the failure is detected in the state callback,
+		// so we need this check here too.
+		if ( g_nConnectionsDone >= g_nRepeat && g_hConnection == k_HSteamNetConnection_Invalid )
+			break;
+
+		// Sleep the remainder of the 50ms tick budget in <=5ms chunks.
+		// Small chunks keep actual tick time close to 50ms even on slow/loaded
+		// runners where a single sleep_for(50ms) can overshoot by 30-40ms.
+		auto tickEnd = tickStart + std::chrono::milliseconds( 50 );
+		for (;;)
+		{
+			auto remaining = tickEnd - std::chrono::steady_clock::now();
+			if ( remaining <= std::chrono::milliseconds( 0 ) )
+				break;
+			if ( remaining > std::chrono::milliseconds( 5 ) )
+				remaining = std::chrono::milliseconds( 5 );
+			std::this_thread::sleep_for( remaining );
 		}
 	}
 
+	TEST_Printf( "Shutting down\n" );
 	Quit(0);
 	return 0;
 }

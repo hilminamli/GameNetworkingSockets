@@ -35,6 +35,14 @@
 #define strncasecmp _strnicmp
 #endif
 
+#ifndef Assert
+	#if defined( STEAMWEBRTC_USE_STATIC_LIBS ) && defined( STEAMNETWORKINGSOCKETS_ENABLE_WEBRTC )
+		#include <tier0/dbg.h>
+	#else
+		#define Assert(x) ((void)0)
+	#endif
+#endif
+
 extern "C"
 {
 	static void (*g_fnWriteEvent_setsockopt)( int slevel, int sopt, int value ) = nullptr;
@@ -60,6 +68,7 @@ public:
 	bool BInitializeOnSocketThread( const ICESessionConfig &cfg );
 	void DestroyOnSocketThread();
 	bool BShuttingDown() const { return m_bShuttingDown; }
+	static bool IsOnSocketThread() { return s_pSocketThread != nullptr && s_pSocketThread->IsCurrent(); }
 
 	//
 	// IICESession
@@ -101,6 +110,7 @@ private:
 	EICECandidateType m_eCachedRouteLocalCandidate;
 	EICECandidateType m_eCachedRouteRemoteCandidate;
 	CandidateAddressString m_szCachedRouteRemoteAddress;
+	std::mutex m_mutexCachedRoute;
 
 	// ICE signals
 	void OnTransportGatheringState_n(cricket::IceTransportInternal* transport);
@@ -122,6 +132,9 @@ private:
 };
 
 
+#define AssertOnSocketThread() Assert( CICESession::IsOnSocketThread() )
+#define AssertNotOnSocketThread() Assert( !CICESession::IsOnSocketThread() )
+
 //-----------------------------------------------------------------------------
 //
 //-----------------------------------------------------------------------------
@@ -131,6 +144,8 @@ IICESession *CreateWebRTCICESession( const ICESessionConfig &cfg, IICESessionDel
 	{
 		return nullptr;
 	}
+
+	AssertNotOnSocketThread();
 
 	CICESession *pSession = new CICESession( pDelegate );
 	if ( !pSession->BInitialize( cfg ) )
@@ -152,6 +167,7 @@ rtc::PhysicalSocketServer *CICESession::s_pSocketServer = nullptr;
 CICESession::CICESession( IICESessionDelegate *pDelegate ) :
 	m_pDelegate( pDelegate )
 {
+	AssertNotOnSocketThread();
 	s_mutex.lock();
 	if ( ++s_nInstaneCount == 1 )
 	{
@@ -172,6 +188,7 @@ CICESession::CICESession( IICESessionDelegate *pDelegate ) :
 //-----------------------------------------------------------------------------
 CICESession::~CICESession()
 {
+	AssertNotOnSocketThread();
 	s_pSocketThread->Invoke<void>( RTC_FROM_HERE, rtc::Bind( &CICESession::DestroyOnSocketThread, this ) );
 
 	s_mutex.lock();
@@ -191,7 +208,7 @@ CICESession::~CICESession()
 
 
 //-----------------------------------------------------------------------------
-// 
+//
 //-----------------------------------------------------------------------------
 bool CICESession::BInitialize( const ICESessionConfig &cfg )
 {
@@ -200,10 +217,12 @@ bool CICESession::BInitialize( const ICESessionConfig &cfg )
 
 
 //-----------------------------------------------------------------------------
-// 
+//
 //-----------------------------------------------------------------------------
 bool CICESession::BInitializeOnSocketThread( const ICESessionConfig &cfg )
 {
+	AssertOnSocketThread();
+
 	#ifdef _WIN32
 		::SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL );
 	#elif !defined(WEBRTC_MARVELL) // Don't change priority on Steam Link hardware
@@ -276,7 +295,7 @@ bool CICESession::BInitializeOnSocketThread( const ICESessionConfig &cfg )
 	port_allocator_flags_ |= cricket::PORTALLOCATOR_DISABLE_LINK_LOCAL_NETWORKS;
 	if ( cfg.m_nCandidateTypes & k_EICECandidate_Any_IPv6 )
 	{
-		port_allocator_flags_ |= 
+		port_allocator_flags_ |=
 			cricket::PORTALLOCATOR_ENABLE_IPV6 |
 			cricket::PORTALLOCATOR_ENABLE_IPV6_ON_WIFI;
 	}
@@ -288,7 +307,7 @@ bool CICESession::BInitializeOnSocketThread( const ICESessionConfig &cfg )
 		for ( int i = 0 ; i < cfg.m_nTurnServers ; ++i )
 		{
 			const ICESessionConfig::TurnServer *pTurn = &cfg.m_pTurnServers[i];
-			
+
 			if ( !pTurn || !pTurn->m_pszHost || !pTurn->m_pszPwd || !pTurn->m_pszUsername ) {
 				continue;
 			}
@@ -319,7 +338,7 @@ bool CICESession::BInitializeOnSocketThread( const ICESessionConfig &cfg )
 				return false;
 			}
 
-			cricket::RelayServerConfig turn(address.hostname(), address.port(), 
+			cricket::RelayServerConfig turn(address.hostname(), address.port(),
 				pTurn->m_pszUsername, pTurn->m_pszPwd, (cricket::ProtocolType) pTurn->m_protocolType);
 			turn_servers.push_back( turn );
 		}
@@ -417,6 +436,8 @@ bool CICESession::BInitializeOnSocketThread( const ICESessionConfig &cfg )
 
 void CICESession::DestroyOnSocketThread()
 {
+	AssertOnSocketThread();
+
 	// Kind of defeats the purpose of using std::unique_ptr to manually
 	// destroy like this, but we really want to control the teardown order.
 	// and we need it to happen in a particular thread, so being "subtle"
@@ -433,11 +454,12 @@ void CICESession::DestroyOnSocketThread()
 //-----------------------------------------------------------------------------
 void CICESession::Destroy()
 {
+	AssertNotOnSocketThread();
 	m_bShuttingDown = true;
 	delete this;
 }
 
-EICECandidateType GetICECandidateType( const cricket::Candidate &candidate )
+static EICECandidateType GetICECandidateType( const cricket::Candidate &candidate )
 {
 	const rtc::SocketAddress &addr = candidate.address();
 	if ( !addr.IsComplete() )
@@ -487,6 +509,8 @@ EICECandidateType GetICECandidateType( const cricket::Candidate &candidate )
 //-----------------------------------------------------------------------------
 EICECandidateType CICESession::AddRemoteIceCandidate( const char *pszCandidate )
 {
+	AssertNotOnSocketThread();
+
 	webrtc::SdpParseError error;
 	cricket::Candidate candidate;
 	if ( !webrtc::SdpDeserializeCandidate(
@@ -532,6 +556,8 @@ void CICESession::OnMessage( rtc::Message* msg )
 
 bool CICESession::BSendData( const void *pData, size_t nSize )
 {
+	// No thread assert here, hot path
+
 	if ( !ice_transport_ || !writable_ )
 		return false;
 
@@ -549,6 +575,7 @@ bool CICESession::BSendData( const void *pData, size_t nSize )
 
 void CICESession::SetRemoteAuth( const char *pszUserFrag, const char *pszPwd )
 {
+	AssertNotOnSocketThread();
 	if ( !ice_transport_ )
 		return;
 	cricket::IceParameters ice_params;
@@ -559,25 +586,31 @@ void CICESession::SetRemoteAuth( const char *pszUserFrag, const char *pszPwd )
 
 bool CICESession::GetWritableState()
 {
+	// Intentionally not taking any locks here
 	return ice_transport_ && writable_;
 }
 
 int CICESession::GetPing()
 {
+	// Intentionally not taking any locks here
 	if ( !ice_transport_ )
-		m_nCachedPing = -1;
+		return -1;
 	return m_nCachedPing;
 }
 
 void CICESession::CacheRouteAndPing()
 {
+	AssertOnSocketThread();
+
+	std::lock_guard<std::mutex> lock( m_mutexCachedRoute );
 	m_bCachedRouteValid = false;
-	m_nCachedPing = -1;
 	if ( !ice_transport_ )
+	{
+		m_nCachedPing = -1;
 		return;
+	}
 	absl::optional<int> rtt = ice_transport_->GetRttEstimate();
-	if ( rtt )
-		m_nCachedPing = *rtt;
+	m_nCachedPing = rtt ? *rtt : -1;
 	const cricket::Connection *conn = ice_transport_->selected_connection();
 	if ( !conn )
 		return;
@@ -596,6 +629,10 @@ void CICESession::CacheRouteAndPing()
 
 bool CICESession::GetRoute( EICECandidateType &eLocalCandidate, EICECandidateType &eRemoteCandidate, CandidateAddressString &szRemoteAddress )
 {
+	// We currently don't ever call this from the socket thread, but there's
+	// no reason it wouldn't work, so no assert here about which thread we're on
+
+	std::lock_guard<std::mutex> lock( m_mutexCachedRoute );
 	if ( !ice_transport_ )
 		m_bCachedRouteValid = false;
 	if ( !m_bCachedRouteValid )
@@ -610,11 +647,13 @@ bool CICESession::GetRoute( EICECandidateType &eLocalCandidate, EICECandidateTyp
 
 void CICESession::OnTransportGatheringState_n(cricket::IceTransportInternal* transport)
 {
+	AssertOnSocketThread();
 	m_pDelegate->Log( IICESessionDelegate::k_ELogPriorityInfo, "P2PTransportChannel::OnTransportGatheringState now %d\n", ice_transport_->gathering_state() );
 }
 
 void CICESession::OnTransportCandidateGathered_n(cricket::IceTransportInternal* transport, const cricket::Candidate& candidate)
 {
+	AssertOnSocketThread();
 	std::string sdp = webrtc::SdpSerializeCandidate( candidate );
 	EICECandidateType eType = GetICECandidateType( candidate );
 	m_pDelegate->OnLocalCandidateGathered( eType, sdp.c_str() );
@@ -622,17 +661,20 @@ void CICESession::OnTransportCandidateGathered_n(cricket::IceTransportInternal* 
 
 void CICESession::OnTransportCandidatesRemoved_n(cricket::IceTransportInternal* transport, const cricket::Candidates& candidates)
 {
+	AssertOnSocketThread();
 	// FIXME delegate doesn't understand this right now
 	m_pDelegate->Log( IICESessionDelegate::k_ELogPriorityWarning, "Ignoring removal of %d ICE candidate\n", (int)candidates.size() );
 }
 
 void CICESession::OnTransportRoleConflict_n(cricket::IceTransportInternal* transport)
 {
+	AssertOnSocketThread();
 	m_pDelegate->Log( IICESessionDelegate::k_ELogPriorityError, "ICE role conflict detected!\n" );
 }
 
 void CICESession::OnTransportStateChanged_n(cricket::IceTransportInternal* transport)
 {
+	AssertOnSocketThread();
 	cricket::IceTransportState state = ice_transport_->GetState();
 	CacheRouteAndPing();
 	if ( state == cricket::IceTransportState::STATE_COMPLETED )
@@ -649,6 +691,8 @@ void CICESession::OnTransportStateChanged_n(cricket::IceTransportInternal* trans
 
 void CICESession::OnWritableState(rtc::PacketTransportInternal* transport)
 {
+	AssertOnSocketThread();
+
 	writable_ = ice_transport_->writable();
 	CacheRouteAndPing();
 	m_pDelegate->Log( IICESessionDelegate::k_ELogPriorityInfo, "ICE OnWritableState now %d\n", (int)writable_ );
@@ -662,6 +706,7 @@ void CICESession::OnReadPacket(
 	const int64_t& packet_time,
 	int flags
 ) {
+	// No thread assert here, hot path
 	m_pDelegate->OnData( data, size );
 }
 
@@ -675,12 +720,14 @@ void CICESession::OnReadyToSend(rtc::PacketTransportInternal* transport)
 
 void CICESession::OnReceivingState(rtc::PacketTransportInternal* transport)
 {
+	AssertOnSocketThread();
 	CacheRouteAndPing();
 	m_pDelegate->Log( IICESessionDelegate::k_ELogPriorityInfo, "ICE OnReceivingState now %d\n", ice_transport_->receiving() );
 }
 
 void CICESession::OnNetworkRouteChanged(absl::optional<rtc::NetworkRoute> network_route)
 {
+	AssertOnSocketThread();
 	CacheRouteAndPing();
 	m_pDelegate->OnRouteChanged();
 	//m_pDelegate->Log( IICESessionDelegate::k_ELogPriorityInfo, "ICE OnNetworkRouteChanged %d\n", ice_transport_->receiving() );

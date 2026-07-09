@@ -1,4 +1,6 @@
-set(SOURCE_PATH ".")
+# For local testing only -- points at the repo root instead of downloading a release.
+# The official vcpkg portfile replaces this line with vcpkg_from_github(...).
+get_filename_component(SOURCE_PATH "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 
 # Select crypto backend based on the selected crypto "feature"
 # WE ARE NOT SUPPOSED TO BE DOING THIS.
@@ -6,9 +8,12 @@ set(SOURCE_PATH ".")
 if ("libsodium" IN_LIST FEATURES)
     set(CRYPTO_BACKEND "libsodium")
 endif()
-if ("bcrypt" IN_LIST FEATURES)
-    set(CRYPTO_BACKEND "BCrypt")
-endif()
+# BCrypt is not supported as a vcpkg feature because it is only used for Xbox,
+# which does not use vcpkg.  If you want to use this for some reason, you'll
+# need to configure and build yourself.
+#if ("bcrypt" IN_LIST FEATURES)
+#    set(CRYPTO_BACKEND "BCrypt")
+#endif()
 if ( ( "${CRYPTO_BACKEND}" STREQUAL "" ) OR ( "openssl" IN_LIST FEATURES ) )
     set(CRYPTO_BACKEND "OpenSSL")
 endif()
@@ -18,6 +23,7 @@ endif()
 vcpkg_check_features(
     OUT_FEATURE_OPTIONS FEATURE_OPTIONS
     FEATURES
+		ice ENABLE_ICE
 		webrtc USE_STEAMWEBRTC
 		examples BUILD_EXAMPLES
 		tests BUILD_TESTS
@@ -43,25 +49,22 @@ if (BUILD_TESTS OR BUILD_TOOLS)
 	set(BUILD_STATIC_LIB true)
 endif()
 
-vcpkg_configure_cmake(
-    SOURCE_PATH ${SOURCE_PATH}
-    PREFER_NINJA
+vcpkg_cmake_configure(
+    SOURCE_PATH "${SOURCE_PATH}"
     OPTIONS
-    -DUSE_CRYPTO=${CRYPTO_BACKEND}
-	-DBUILD_STATIC_LIB=${BUILD_STATIC_LIB}
-	-DBUILD_SHARED_LIB=${BUILD_SHARED_LIB}
-	-DMSVC_CRT_STATIC=${MSVC_CRT_STATIC}
-    ${FEATURE_OPTIONS}
+        -DUSE_CRYPTO=${CRYPTO_BACKEND}
+        -DBUILD_STATIC_LIB=${BUILD_STATIC_LIB}
+        -DBUILD_SHARED_LIB=${BUILD_SHARED_LIB}
+        -DMSVC_CRT_STATIC=${MSVC_CRT_STATIC}
+        ${FEATURE_OPTIONS}
 )
 
 vcpkg_cmake_install()
+vcpkg_cmake_config_fixup(CONFIG_PATH "lib/cmake/GameNetworkingSockets")
+vcpkg_fixup_pkgconfig()
 
-# Copy some files
-
-file(INSTALL ${SOURCE_PATH}/LICENSE DESTINATION ${CURRENT_PACKAGES_DIR}/share/${PORT} RENAME copyright)
-vcpkg_copy_pdbs()
-
-# Cleanup some file droppings that our cmakefile really should
-# not be publishing
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/share")
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
+
+vcpkg_copy_pdbs()
+vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")

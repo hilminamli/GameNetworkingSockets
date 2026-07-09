@@ -28,12 +28,17 @@ perf.data.old
 # Default/recommended install directory for vcpkg
 **/vcpkg
 
+# AI assistant files
+.claude/
+CLAUDE.md
+AGENTS.md
+
 # Other misc stuff
 *.VC.*
 **/.vscode
-**/build
-**/build-*
-**/build.bat
+/build
+/build-*
+/build.bat
 **/log.txt
 **/.vs
 /src/steamnetworkingsockets/Messageswin64Debug/*
@@ -65,13 +70,15 @@ src/common/*.pb.h
 
 # Protobuf has some test scripts and we get warnings about line endings
 src/external/protobuf-3.15.3/**/*.sh
+
+# Fork additions: C# binding build output + tooling local state
 bindings/csharp/bin/
 bindings/csharp/obj/
 bindings/csharp/Tests/bin/
 bindings/csharp/Tests/obj/
 bindings/csharp/nupkg/
-
-# Tooling local state
+bindings/csharp/*/bin/
+bindings/csharp/*/obj/
 .claude/
 .serena/
 build-linux/
@@ -79,5 +86,9 @@ build-win-static/
 build-static/
 vcpkg_installed/
 
-bindings/csharp/*/bin/
-bindings/csharp/*/obj/
+#
+# Entries below here should be items that might differ between the main and partner branches
+#
+
+# Partner branch puts extra 'modules' into this folder.  We don't do any of that.
+/modules

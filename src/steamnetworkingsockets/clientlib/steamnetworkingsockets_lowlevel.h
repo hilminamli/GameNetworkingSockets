@@ -30,6 +30,16 @@ namespace SteamNetworkingSocketsLib {
 
 class IRawUDPSocket;
 
+constexpr int k_nIPClassify_IPv4 = (1<<0);
+constexpr int k_nIPClassify_IPv6 = (1<<1);
+constexpr int k_nIPClassify_Public = (1<<2);
+constexpr int k_nIPClassify_LAN = (1<<3);
+constexpr int k_nIPClassify_Localhost = (1<<4);
+constexpr int k_nIPClassify_Mock = (1<<5);
+
+extern int ClassifyIP( const SteamNetworkingIPAddr &ip );
+extern int ClassifyIP( const CIPAddress &ip );
+
 /////////////////////////////////////////////////////////////////////////////
 //
 // Low level sockets
@@ -74,7 +84,7 @@ public:
 	/// A template constructor so you can use type safe context and avoid messy casting
 	template< typename T >
 	inline CRecvPacketCallback( void (*fnCallback)( const RecvPktInfo_t &info, T context ), T context )
-	: m_fnCallback ( reinterpret_cast< FCallbackRecvPacket>( fnCallback ) )
+	: m_fnCallback ( reinterpret_cast< FCallbackRecvPacket>( reinterpret_cast< void * >( fnCallback ) ) )
 	, m_pContext( reinterpret_cast< void * >( context ) )
 	{
 		COMPILE_TIME_ASSERT( sizeof(T) == sizeof(void*) );
@@ -261,7 +271,7 @@ public:
 	{
 		return m_pRawSock->BSendRawPacket( pPkt, cbPkt, adrTo );
 	}
-	
+
 	bool BSendRawPacketGather( int nChunks, const iovec *pChunks, const SteamNetworkingIPAddr &adrTo ) const
 	{
 		return m_pRawSock->BSendRawPacketGather( nChunks, pChunks, adrTo );
@@ -321,17 +331,36 @@ private:
 
 extern int g_cbUDPSocketBufferSize;
 
-/////////////////////////////////////////////////////////////////////////////
-//
-// Misc low level service thread stuff
-//
-/////////////////////////////////////////////////////////////////////////////
-
 /// Called when we know it's safe to actually destroy sockets pending deletion.
 /// This is when: 1.) We own the lock and 2.) we aren't polling in the service thread.
 extern void ProcessPendingDestroyClosedRawUDPSockets();
 
-/// Last time that we spewed something that was subject to rate limit 
+/// Return true if the service thread is running
+extern bool IsServiceThreadRunning();
+
+/// Wake up the service thread ASAP.  Intended to be called from other threads,
+/// but is safe to call from the service thread as well.
+extern void WakeServiceThread();
+
+/// Return true if it looks like the address is a local address
+extern bool IsRouteToAddressProbablyLocal( netadr_t addr );
+
+extern bool ResolveHostname( const char* pszHostname, CUtlVector< SteamNetworkingIPAddr > *pAddrs );
+
+struct LocalAddress_t
+{
+	SteamNetworkingIPAddr m_addr;
+	int m_nPrefixLen; // Subnet prefix length, e.g. 24 for a /24.  0 if unavailable or bogus.
+};
+extern bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs );
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Spew
+//
+/////////////////////////////////////////////////////////////////////////////
+
+/// Last time that we spewed something that was subject to rate limit
 extern SteamNetworkingMicroseconds g_usecLastRateLimitSpew;
 extern int g_nRateLimitSpewCount;
 
@@ -381,6 +410,10 @@ extern bool BSteamNetworkingSocketsLowLevelAddRef( SteamDatagramErrMsg &errMsg )
 /// Nuke common stuff
 extern void SteamNetworkingSocketsLowLevelDecRef();
 
+extern void FlushSystemSpew();
+extern void InitSpew();
+extern void KillSpew();
+
 /////////////////////////////////////////////////////////////////////////////
 //
 // Locking
@@ -405,7 +438,7 @@ extern void SteamNetworkingSocketsLowLevelDecRef();
 // prefer to keep the code simple until we have a proven example of bad performance.
 //
 // Here are the locks that are used:
-// 
+//
 // - Global lock.  You must hold this lock while:
 //   - Changing any data not specifically carved out below.
 //   - Creating or destroying objects
@@ -526,8 +559,24 @@ struct Lock : LockDebugInfo
 	inline bool try_lock_for( int msTimeout, const char *pszTag = nullptr )
 	{
 		LockDebugInfo::AboutToLock( true );
-		if ( !m_impl.try_lock_for( std::chrono::milliseconds( msTimeout ) ) )
-			return false;
+		#ifdef __SANITIZE_THREAD__
+			// TSan does not intercept pthread_mutex_timedlock, so try_lock_for() leaves
+			// the lock untracked from TSan's perspective, causing false "unlock by wrong
+			// thread" reports later.  Use try_lock() in a loop instead: pthread_mutex_trylock
+			// IS intercepted, so TSan correctly tracks ownership.
+			auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds( msTimeout );
+			for (;;)
+			{
+				if ( m_impl.try_lock() )
+					break;
+				if ( std::chrono::steady_clock::now() >= deadline )
+					return false;
+				std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+			}
+		#else
+			if ( !m_impl.try_lock_for( std::chrono::milliseconds( msTimeout ) ) )
+				return false;
+		#endif
 		LockDebugInfo::OnLocked( pszTag );
 		return true;
 	}
@@ -608,10 +657,12 @@ using ShortDurationScopeLock = ScopeLock<ShortDurationLock>;
 	#define AssertHeldByCurrentThread( ... ) _AssertHeldByCurrentThread( __FILE__, __LINE__ ,## __VA_ARGS__ )
 	#define AssertLocksHeldByCurrentThread( ... ) _AssertLocksHeldByCurrentThread( __FILE__, __LINE__,## __VA_ARGS__ )
 	#define TakeLockOwnership( pLock, ... ) _TakeLockOwnership( (pLock), __FILE__, __LINE__,## __VA_ARGS__ )
+	extern void AssertGlobalLockHeldExactlyOnce();
 #else
 	#define AssertHeldByCurrentThread( ... ) _AssertHeldByCurrentThread( nullptr, 0,## __VA_ARGS__ )
 	#define AssertLocksHeldByCurrentThread( ... ) _AssertLocksHeldByCurrentThread( nullptr, 0,## __VA_ARGS__ )
 	#define TakeLockOwnership( pLock, ... ) _TakeLockOwnership( (pLock), nullptr, 0,## __VA_ARGS__ )
+	inline void AssertGlobalLockHeldExactlyOnce() {}
 #endif
 
 /// Special utilities for acquiring the global lock
@@ -634,16 +685,13 @@ struct SteamNetworkingGlobalLock
 	#endif
 };
 
-#ifdef DBGFLAG_VALIDATE
-extern void SteamNetworkingSocketsLowLevelValidate( CValidator &validator );
-#endif
+extern SteamNetworkingMicroseconds s_usecServiceThreadLockWaitWarning;
 
-/// Return true if the service thread is running
-extern bool IsServiceThreadRunning();
-
-/// Wake up the service thread ASAP.  Intended to be called from other threads,
-/// but is safe to call from the service thread as well.
-extern void WakeServiceThread();
+/////////////////////////////////////////////////////////////////////////////
+//
+// Task queue
+//
+/////////////////////////////////////////////////////////////////////////////
 
 class CQueuedTask;
 
@@ -784,6 +832,9 @@ public:
 	// Return true if the task list is empty
 	inline bool empty() const { return m_pFirstTask == nullptr; }
 
+	// Delete tasks, without running them.
+	void DeleteTasks();
+
 private:
 	// List of queued tasks
 	CQueuedTask *m_pFirstTask;
@@ -803,19 +854,20 @@ extern CTaskList g_taskListRunInBackground;
 //
 /////////////////////////////////////////////////////////////////////////////
 
-/// Fetch current time
-extern SteamNetworkingMicroseconds SteamNetworkingSockets_GetLocalTimestamp();
+#ifdef DBGFLAG_VALIDATE
+extern void SteamNetworkingSocketsLowLevelValidate( CValidator &validator );
+#endif
+
+extern void SeedWeakRandomGenerator();
+extern void ETW_LongOp( const char *opName, SteamNetworkingMicroseconds usec, const char *pszInfo );
 
 /// Set debug output hook
 extern void SteamNetworkingSockets_SetDebugOutputFunction( ESteamNetworkingSocketsDebugOutputType eDetailLevel, FSteamNetworkingSocketsDebugOutput pfnFunc );
 
-/// Return true if it looks like the address is a local address
-extern bool IsRouteToAddressProbablyLocal( netadr_t addr );
-
-extern bool ResolveHostname( const char* pszHostname, CUtlVector< SteamNetworkingIPAddr > *pAddrs );
-extern bool GetLocalAddresses( CUtlVector< SteamNetworkingIPAddr >* pAddrs );
-
 } // namespace SteamNetworkingSocketsLib
+
+/// Fetch current time
+extern SteamNetworkingMicroseconds SteamNetworkingSockets_GetLocalTimestamp();
 
 STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_DefaultPreFormatDebugOutputHandler( ESteamNetworkingSocketsDebugOutputType eType, bool bFmt, const char* pstrFile, int nLine, const char *pMsg, va_list ap );
 

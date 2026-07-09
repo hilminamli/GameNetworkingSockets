@@ -13,6 +13,11 @@ find_package(Protobuf QUIET CONFIG)
 if(NOT Protobuf_FOUND)
 	find_package(Protobuf REQUIRED)
 endif()
+# Module mode (FindProtobuf.cmake) creates Protobuf::libprotobuf (capital P);
+# config mode creates protobuf::libprotobuf (lowercase). Alias so either works.
+if(NOT TARGET protobuf::libprotobuf AND TARGET Protobuf::libprotobuf)
+	add_library(protobuf::libprotobuf ALIAS Protobuf::libprotobuf)
+endif()
 find_package(Threads REQUIRED)
 
 set(GNS_COMMON_PROTOS
@@ -45,12 +50,13 @@ set(GNS_CLIENTLIB_SRCS
 	"steamnetworkingsockets/clientlib/csteamnetworkingmessages.cpp"
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_flat.cpp"
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_connections.cpp"
-	"steamnetworkingsockets/clientlib/steamnetworkingsockets_lowlevel.cpp"
+	"steamnetworkingsockets/clientlib/steamnetworkingsockets_socketthread.cpp"
+	"steamnetworkingsockets/clientlib/steamnetworkingsockets_lowlevel_misc.cpp"
+	"steamnetworkingsockets/clientlib/steamnetworkingsockets_spew.cpp"
+	"steamnetworkingsockets/clientlib/steamnetworkingsockets_taskqueue.cpp"
+	"steamnetworkingsockets/clientlib/steamnetworkingsockets_ice_client.cpp"
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_p2p.cpp"
-	"steamnetworkingsockets/clientlib/steamnetworkingsockets_stun.cpp"
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_p2p_ice.cpp"
-	# Entire file is inside #ifdef STEAMNETWORKINGSOCKETS_ENABLE_WEBRTC — compiles
-	# to nothing unless USE_STEAMWEBRTC defines it (see below).
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_p2p_webrtc.cpp"
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_snp.cpp"
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_udp.cpp"
@@ -125,6 +131,7 @@ endmacro()
 
 # If WebRTC enabled, build the thin wrapper library
 if(USE_STEAMWEBRTC)
+	set(ABSL_PROPAGATE_CXX_STD ON)
 	add_subdirectory(external/steamwebrtc)
 endif(USE_STEAMWEBRTC)
 
@@ -270,15 +277,20 @@ macro(set_clientlib_target_properties GNS_TARGET)
 
 		# Wrapper lib is always linked statically in the opensource code.
 		# We might link dynamically in other environments.
-		# STEAMNETWORKINGSOCKETS_ENABLE_WEBRTC is what the runtime implementation
-		# selection (steamnetworkingsockets_p2p_ice.cpp) checks — without it the
-		# webrtc-lite code is compiled but unreachable and P2P silently falls back
-		# to the native ICE client. Upstream only defines it for Valve-internal
-		# Steam builds; define it here whenever webrtc is requested.
 		target_compile_definitions(${GNS_TARGET} PRIVATE
 			STEAMWEBRTC_USE_STATIC_LIBS
 			STEAMNETWORKINGSOCKETS_ENABLE_WEBRTC
 			)
+
+		# Tell ice_session.cpp it's being compiled for GNS so it can use GNS assert infrastructure.
+		target_compile_definitions(steamwebrtc PRIVATE
+			STEAMNETWORKINGSOCKETS_ENABLE_WEBRTC
+			STEAMWEBRTC_USE_STATIC_LIBS
+			)
+		target_include_directories(steamwebrtc PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR}/public
+			)
+
 		target_link_libraries(${GNS_TARGET} PUBLIC
 			$<BUILD_INTERFACE:steamwebrtc>
 			$<INSTALL_INTERFACE:GameNetworkingSockets::steamwebrtc>
@@ -318,6 +330,8 @@ macro(set_clientlib_target_properties GNS_TARGET)
 		#	target_link_libraries(${GNS_TARGET} PRIVATE dl)
 		#endif()
 	elseif(CMAKE_SYSTEM_NAME MATCHES FreeBSD)
+
+	elseif(CMAKE_SYSTEM_NAME MATCHES OpenBSD)
 
 	elseif(CMAKE_SYSTEM_NAME MATCHES Windows)
 		if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
@@ -364,17 +378,29 @@ if (BUILD_STATIC_LIB)
 	set_clientlib_target_properties(GameNetworkingSockets_s)
 endif()
 
+# Test-only static library variant -- includes the mock network framework.
+# Never shipped; only built when tests are enabled. test_p2p links against
+# this instead of the regular static library.
+if (BUILD_TESTS AND BUILD_STATIC_LIB AND ENABLE_ICE)
+	add_library(GameNetworkingSockets_test_s STATIC "")
+	add_library(GameNetworkingSockets::static_mock ALIAS GameNetworkingSockets_test_s)
+	target_compile_definitions(GameNetworkingSockets_test_s INTERFACE STEAMNETWORKINGSOCKETS_STATIC_LINK)
+	set_clientlib_target_properties(GameNetworkingSockets_test_s)
+	target_compile_definitions(GameNetworkingSockets_test_s PUBLIC STEAMNETWORKINGSOCKETS_ENABLE_MOCK)
+endif()
+
 #
 # Cert tool
 #
 if (BUILD_TOOLS)
 
-	# The cert tool requires picojson.
-	set(picojson_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/picojson)
-	check_submodule( ${picojson_SOURCE_DIR} ${picojson_SOURCE_DIR}/picojson.h )
+	# The cert tool requires vjson.
+	set(vjson_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/vjson)
+	check_submodule( ${vjson_SOURCE_DIR} ${vjson_SOURCE_DIR}/vjson.h )
 
 	add_executable(steamnetworkingsockets_certtool
 		"steamnetworkingsockets/certtool/steamnetworkingsockets_certtool.cpp"
+		${vjson_SOURCE_DIR}/vjson.cpp
 		)
 	target_sources(steamnetworkingsockets_certtool PRIVATE
 		${GNS_COMMON_SRCS}
@@ -386,7 +412,7 @@ if (BUILD_TOOLS)
 	target_include_directories(steamnetworkingsockets_certtool PUBLIC
 		"$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>"
 		"$<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${CMAKE_INSTALL_INCLUDEDIR}/GameNetworkingSockets>"
-		${picojson_SOURCE_DIR}
+		${vjson_SOURCE_DIR}
 		)
 
 	target_include_directories(steamnetworkingsockets_certtool PRIVATE

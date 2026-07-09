@@ -112,10 +112,23 @@ run_matrix_for_current_compiler() {
 	# Build some tests with sanitizers
 	if [[ ${build_sanitizers} -ne 0 ]]; then
 		run_single --compiler "${compiler}" --build-dir build-asan --sanitizer asan --targets test_connection test_crypto --run-tests
+		run_single --compiler "${compiler}" --build-dir build-asan --sanitizer asan \
+			--run-tests --tests test_connection:soak \
+			--phase test
 		run_single --compiler "${compiler}" --build-dir build-ubsan --sanitizer ubsan --targets test_connection test_crypto --run-tests
 		if [[ ${CXX} == *clang* ]]; then
 			run_single --compiler "${compiler}" --build-dir build-tsan --sanitizer tsan --targets test_connection test_crypto --run-tests
 		fi
+	fi
+
+	# TSan with libsodium (avoids OpenSSL false positives).
+	# Only clang, only x86_64 (tsan not reliable elsewhere).
+	if [[ "${compiler}" == "clang" ]] && [[ "${uname_M}" == x86_64 ]]; then
+		run_single --compiler "${compiler}" --build-dir build-tsan \
+			--sanitizer tsan \
+			--crypto libsodium --crypto25519 libsodium \
+			--targets test_connection test_crypto \
+			--run-tests
 	fi
 
 	# Build normal unsanitized binaries
@@ -123,6 +136,9 @@ run_matrix_for_current_compiler() {
 
 	# Build debug build
 	run_single --compiler "${compiler}" --build-dir build-cmake-debug --build-type Debug --run-tests
+	run_single --compiler "${compiler}" --build-dir build-cmake-debug --build-type Debug \
+		--run-tests --tests test_connection:soak \
+		--phase test
 
 	# Build binaries with LTO. Optional, some compilers don't support LTO.
 	if ! run_single --compiler "${compiler}" --build-dir build-cmake-lto --build-type Release --lto --run-tests; then

@@ -89,10 +89,11 @@ DEFINE_CONNECTON_DEFAULT_CONFIGVAL( int32, MTU_PacketSize, 1300, k_cbSteamNetwor
 	// We don't have a trusted third party, so allow this by default,
 	// and don't warn about it
 	DEFINE_CONNECTON_DEFAULT_CONFIGVAL( int32, IP_AllowWithoutAuth, 2, 0, 2 );
+	DEFINE_CONNECTON_DEFAULT_CONFIGVAL( int32, IPLocalHost_AllowWithoutAuth, 2, 0, 2 );
 #else
 	DEFINE_CONNECTON_DEFAULT_CONFIGVAL( int32, IP_AllowWithoutAuth, 0, 0, 2 );
+	DEFINE_CONNECTON_DEFAULT_CONFIGVAL( int32, IPLocalHost_AllowWithoutAuth, 0, 0, 2 );
 #endif
-DEFINE_CONNECTON_DEFAULT_CONFIGVAL( int32, IPLocalHost_AllowWithoutAuth, 0, 0, 2 );
 DEFINE_CONNECTON_DEFAULT_CONFIGVAL( int32, Unencrypted, 0, 0, 3 );
 DEFINE_CONNECTON_DEFAULT_CONFIGVAL( int32, SymmetricConnect, 0, 0, 1 );
 DEFINE_CONNECTON_DEFAULT_CONFIGVAL( int32, LocalVirtualPort, -1, -1, INT32_MAX );
@@ -253,7 +254,7 @@ TableLock g_tables_lock;
 
 // Table of active listen sockets.  Listen sockets and this table are protected
 // by the global lock.
-CUtlHashMap<int, CSteamNetworkListenSocketBase *, std::equal_to<int>, Identity<int> > g_mapListenSockets; 
+CUtlHashMap<int, CSteamNetworkListenSocketBase *, std::equal_to<int>, Identity<int> > g_mapListenSockets;
 
 static bool BConnectionStateExistsToAPI( ESteamNetworkingConnectionState eState )
 {
@@ -348,7 +349,7 @@ static CSteamNetworkConnectionBase *InternalGetConnectionByHandle( HSteamNetConn
 				// which will unlock the table lock here, OUT OF ORDER of the order
 				// that we took the locks.  That's intentional!  We don't need that
 				// lock anymore, we have locked the connection that we want.
-				return pResult; 
+				return pResult;
 			}
 		}
 
@@ -358,7 +359,7 @@ static CSteamNetworkConnectionBase *InternalGetConnectionByHandle( HSteamNetConn
 		scopeLock.Unlock();
 		break;
 	}
-	
+
 	return nullptr;
 }
 
@@ -761,7 +762,7 @@ bool CSteamNetworkingSockets::InternalSetCertificate( const void *pCertificate, 
 	{
 		// The degree to which the key is actually "private" is not
 		// really known to us.  However there are some use cases where
-		// we will accept a cert 
+		// we will accept a cert
 		const std::string &private_key_data = msgCertSigned.private_key_data();
 		if ( m_keyPrivateKey.IsValid() )
 		{
@@ -871,6 +872,21 @@ void CSteamNetworkingSockets::CheckAuthenticationPrerequisites( SteamNetworkingM
 
 	if ( !BCanRequestCert() )
 		return;
+
+	// Make sure we don't infinitely recurse here.
+	// We might have a cert, but it's expired, so we try to request a new cert.
+	// That might immediately fail.   But we already have a cert,
+	// so we might try to schedule the next check by calling this function.
+	// Which will immediately try to request a new cert (since the one we have is
+	// expired), which might immediately fail, .... etc
+	static bool s_bRecursionCheck = false;
+	if ( s_bRecursionCheck )
+	{
+		m_scheduleCheckRenewCert.EnsureMinScheduleTime( SteamNetworkingSockets_GetLocalTimestamp() + k_nMillion*10 );
+		return;
+	}
+	s_bRecursionCheck = true;
+	RunCodeAtScopeExit( s_bRecursionCheck = false );
 
 	// Check if we're in flight already.
 	bool bInFlight = BCertRequestInFlight();
@@ -1255,7 +1271,7 @@ EResult CSteamNetworkingSockets::SendMessageToConnection( HSteamNetConnection hC
 	return pConn->APISendMessageToConnection( pData, cbData, nSendFlags, pOutMessageNumber );
 }
 
-void CSteamNetworkingSockets::SendMessages( int nMessages, SteamNetworkingMessage_t *const *pMessages, int64 *pOutMessageNumberOrResult )
+void CSteamNetworkingSockets::SendMessages( int nMessages, SteamNetworkingMessage_t **pMessages, int64 *pOutMessageNumberOrResult, bool bDeleteFailedMessages )
 {
 
 	// Get list of messages, grouped by connection.
@@ -1291,7 +1307,8 @@ void CSteamNetworkingSockets::SendMessages( int nMessages, SteamNetworkingMessag
 		{
 			if ( pOutMessageNumberOrResult )
 				pOutMessageNumberOrResult[i] = -k_EResultInvalidParam;
-			pMsg->Release();
+			if ( bDeleteFailedMessages )
+				pMsg->Release();
 			continue;
 		}
 
@@ -1315,6 +1332,7 @@ void CSteamNetworkingSockets::SendMessages( int nMessages, SteamNetworkingMessag
 	HSteamNetConnection hConn = k_HSteamNetConnection_Invalid;
 	ConnectionScopeLock connectionLock;
 	bool bConnectionThinkImmediately = false;
+	bool bCurrentConnectionFailed = false;
 	for ( SortMsg_t *pSort = pSortMessages ; pSort < pSortEnd ; ++pSort )
 	{
 
@@ -1334,13 +1352,20 @@ void CSteamNetworkingSockets::SendMessages( int nMessages, SteamNetworkingMessag
 			// Locate the connection
 			hConn = pSort->m_hConn;
 			pConn = GetConnectionByHandleForAPI( hConn, connectionLock, "SendMessages" );
+			bCurrentConnectionFailed = false;
 		}
 
-		CSteamNetworkingMessage *pMsg = static_cast<CSteamNetworkingMessage*>( pMessages[pSort->m_idx] );
+		const int idx = pSort->m_idx;
+		CSteamNetworkingMessage *pMsg = static_cast<CSteamNetworkingMessage*>( pMessages[idx] );
 
-		// Current connection is valid?
+		// Once a message fails on a connection, subsequent messages to that connection
+		// are not attempted.  Result stays 0 (set by the memset above).
 		int64 result;
-		if ( pConn )
+		if ( bCurrentConnectionFailed )
+		{
+			result = 0;
+		}
+		else if ( pConn )
 		{
 
 			// Attempt to send
@@ -1348,16 +1373,30 @@ void CSteamNetworkingSockets::SendMessages( int nMessages, SteamNetworkingMessag
 			result = pConn->APISendMessageToConnection( pMsg, usecNow, &bThinkImmediately );
 			if ( bThinkImmediately )
 				bConnectionThinkImmediately = true;
+			if ( result > 0 )
+			{
+				// Successfully queued.  Clear pointer to let caller know, if
+				// they requested this mode of operation.
+				if ( !bDeleteFailedMessages )
+					pMessages[idx] = nullptr;
+			}
 		}
 		else
 		{
-			pMsg->Release();
+			// Connection handle not found -- first message reports the error;
+			// subsequent messages to the same connection get result=0 (not attempted).
 			result = -k_EResultInvalidParam;
 		}
 
-		// Return result for this message if they asked for it
+		if ( result <= 0 )
+		{
+			bCurrentConnectionFailed = true;
+			if ( bDeleteFailedMessages )
+				pMsg->Release();
+		}
+
 		if ( pOutMessageNumberOrResult )
-			pOutMessageNumberOrResult[pSort->m_idx] = result;
+			pOutMessageNumberOrResult[idx] = result;
 	}
 
 	// Flush out last connection, if any
@@ -1532,29 +1571,29 @@ bool CSteamNetworkingSockets::GetListenSocketAddress( HSteamListenSocket hSocket
 	return pSock->APIGetAddress( pAddress );
 }
 
-bool CSteamNetworkingSockets::CreateSocketPair( HSteamNetConnection *pOutConnection1, HSteamNetConnection *pOutConnection2, bool bUseNetworkLoopback, const SteamNetworkingIdentity *pIdentity1, const SteamNetworkingIdentity *pIdentity2 )
+bool CSteamNetworkingSockets::CreateSocketPair( HSteamNetConnection *pOutConnection1, HSteamNetConnection *pOutConnection2, bool bUseNetworkLoopback, const SteamNetworkingIdentity *pPeerIdentity1, const SteamNetworkingIdentity *pPeerIdentity2 )
 {
 	SteamNetworkingGlobalLock scopeLock( "CreateSocketPair" );
 
 	// Assume failure
 	*pOutConnection1 = k_HSteamNetConnection_Invalid;
 	*pOutConnection2 = k_HSteamNetConnection_Invalid;
-	SteamNetworkingIdentity identity[2];
-	if ( pIdentity1 )
-		identity[0] = *pIdentity1;
+	SteamNetworkingIdentity peerIdentity[ 2 ] = {};
+	if ( pPeerIdentity1 )
+		peerIdentity[0] = *pPeerIdentity1;
 	else
-		identity[0].SetLocalHost();
-	if ( pIdentity2 )
-		identity[1] = *pIdentity2;
+		peerIdentity[0].SetLocalHost();
+	if ( pPeerIdentity2 )
+		peerIdentity[1] = *pPeerIdentity2;
 	else
-		identity[1].SetLocalHost();
+		peerIdentity[1].SetLocalHost();
 
 	// Create network connections?
 	if ( bUseNetworkLoopback )
 	{
 		// Create two connection objects
 		CSteamNetworkConnectionlocalhostLoopback *pConn[2];
-		if ( !CSteamNetworkConnectionlocalhostLoopback::APICreateSocketPair( this, pConn, identity ) )
+		if ( !CSteamNetworkConnectionlocalhostLoopback::APICreateSocketPair( this, pConn, peerIdentity ) )
 			return false;
 
 		// Return their handles
@@ -1565,7 +1604,7 @@ bool CSteamNetworkingSockets::CreateSocketPair( HSteamNetConnection *pOutConnect
 	{
 		// Create two connection objects
 		CSteamNetworkConnectionPipe *pConn[2];
-		if ( !CSteamNetworkConnectionPipe::APICreateSocketPair( this, pConn, identity ) )
+		if ( !CSteamNetworkConnectionPipe::APICreateSocketPair( this, pConn, peerIdentity ) )
 			return false;
 
 		// Return their handles
@@ -1730,9 +1769,8 @@ void CSteamNetworkingSockets::InternalQueueCallback( int nCallback, int cbCallba
 		AssertMsg( false, "Callback doesn't fit!" );
 		return;
 	}
-	AssertMsg( len( m_vecPendingCallbacks ) < 100, "Callbacks backing up and not being checked.  Need to check them more frequently!" );
-
 	m_mutexPendingCallbacks.lock();
+	AssertMsg( len( m_vecPendingCallbacks ) < 100, "Callbacks backing up and not being checked.  Need to check them more frequently!" );
 	QueuedCallback &q = *push_back_get_ptr( m_vecPendingCallbacks );
 	q.nCallback = nCallback;
 	q.fnCallback = fnRegisteredFunctionPtr;
@@ -1906,7 +1944,7 @@ static bool AssignConfigValueTyped( int32 *pVal, ESteamNetworkingConfigDataType 
 			int64 arg = *(int64*)pArg;
 			if ( (int32)arg != arg )
 				return false; // Cannot truncate!
-			*pVal = *(int32*)arg;
+			*pVal = (int32)arg;
 			break;
 		}
 
@@ -2438,8 +2476,10 @@ const char *CSteamNetworkingUtils::GetPlatformString()
 		return "windows";
 	#elif IsLinux()
 		return "linux";
-	#elif defined( FREEBSD ) || defined( __FreeBSD__ )
+	#elif IsFreeBSD()
 		return "freebsd";
+	#elif IsOpenBSD()
+		return "openbsd";
 	#else
 		#error "Unknown platform"
 	#endif

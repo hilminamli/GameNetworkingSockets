@@ -5,7 +5,10 @@
 #pragma once
 
 #include "steamnetworkingsockets_connections.h"
+
+#include <tier0/memdbg_save_off.h>
 #include <steamnetworkingsockets_messages_udp.pb.h>
+#include <tier0/memdbg_restore.h>
 
 namespace SteamNetworkingSocketsLib {
 
@@ -239,7 +242,7 @@ public:
 	CSteamNetworkConnectionlocalhostLoopback( CSteamNetworkingSockets *pSteamNetworkingSocketsInterface, const SteamNetworkingIdentity &identity, ConnectionScopeLock &scopeLock );
 
 	/// Setup two connections to be talking to each other
-	static bool APICreateSocketPair( CSteamNetworkingSockets *pSteamNetworkingSocketsInterface, CSteamNetworkConnectionlocalhostLoopback *pConn[2], const SteamNetworkingIdentity pIdentity[2] );
+	static bool APICreateSocketPair( CSteamNetworkingSockets *pSteamNetworkingSocketsInterface, CSteamNetworkConnectionlocalhostLoopback *pConn[2], const SteamNetworkingIdentity pPeerIdentity[2] );
 
 	/// Base class overrides
 	virtual EUnsignedCert AllowRemoteUnsignedCert() override;

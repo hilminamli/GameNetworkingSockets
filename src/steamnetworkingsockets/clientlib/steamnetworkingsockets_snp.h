@@ -378,15 +378,15 @@ struct SSNPSenderState
 		inline int PendingBytesTotal() const { return m_cbPendingUnreliable + m_cbPendingReliable; }
 
 		/// Multiplier used to calculate virtual finish time.
-		float m_flBytesToVirtualTime;
+		float m_flBytesToVirtualTime = 0.0f;
 
 		/// Index of the priority class we belong to.  Priority classes
 		/// are sorted, and so a lower m_idxPriorityClass means lower priority.
-		uint16 m_idxPriorityClass;
+		uint16 m_idxPriorityClass = 0;
 
 		/// Weight value they used.  This is only meaningful
 		/// relative to the other lanes with the same priority class
-		uint16 m_nWeight;
+		uint16 m_nWeight = 0;
 	};
 	#if STEAMNETWORKINGSOCKETS_MAX_LANES > 4
 		std_vector<Lane> m_vecLanes;
@@ -618,6 +618,23 @@ struct SSNPReceiverState
 	/// and then we we may report higher numbered blocks, or we may
 	/// stop and wait to report more acks until later.
 	void QueueFlushAllAcks( SteamNetworkingMicroseconds usecWhen );
+
+	/// If the pending-ack iterator has advanced onto a gap that has no ack
+	/// deadline (m_usecWhenAckPrior == INT64_MAX), point it back at the
+	/// sentinel.  By the monotonic-deadline invariant documented on
+	/// m_itPendingAck, if the gap it lands on has no deadline, then neither
+	/// does any later gap, so there is genuinely nothing scheduled and the
+	/// sentinel is the canonical representation.  Call this after advancing
+	/// m_itPendingAck (when sending acks, or filling/expiring gaps) to restore
+	/// the invariant.  Idempotent if it already points at the sentinel.
+	inline void CollapsePendingAckIfUnscheduled()
+	{
+		if ( m_itPendingAck->second.m_usecWhenAckPrior != INT64_MAX )
+			return;
+		m_itPendingAck = m_mapPacketGaps.end();
+		--m_itPendingAck;
+		Assert( m_itPendingAck->second.m_nEnd == INT64_MAX ); // must be the sentinel now
+	}
 
 	/// Return the time when we need to flush out acks, or INT64_MAX
 	/// if we don't have any acks pending right now.

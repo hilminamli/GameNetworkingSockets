@@ -1,16 +1,11 @@
 //====== Copyright Valve Corporation, All rights reserved. ====================
 //
-// "Low level" stuff used by the SteamNetworkingSockets client library to
-// interface with the operating system.  Ideally, most OS-specific details are
-// handled in this file.
+// Socket and service thread management for SteamNetworkingSockets.
 //
 // - Dealing with OS sockets, sending/receiving of UDP packets
 // - Simulating network conditions such as fake lag/loss/reording/jitter
 // - Managing the main service thread, polling efficiently
 // - Dispatching received packets to the registered callbacks.
-// - Lock (mutex) details, especially hygiene enforcement and debugging
-// - Handling 'spew' (diagnostic messages, asserts, etc) from the library
-// - Queued task system
 // - Support for wifi adapters that can send on both bands simultaneously
 //
 #include <thread>
@@ -18,6 +13,7 @@
 #include <atomic>
 
 #include "steamnetworkingsockets_lowlevel.h"
+#include "steamnetworkingsockets_mock.h"
 #include <tier0/platform_sockets.h>
 #include "../steamnetworkingsockets_internal.h"
 #include "../steamnetworkingsockets_thinker.h"
@@ -83,25 +79,17 @@ constexpr int k_cbETWEventUDPPacketDataSize = 16;
 	#define CMSG_NXTHDR WSA_CMSG_NXTHDR
 #endif
 
+#ifdef _WIN32
+	// wincrypt.h defines CMSG_DATA as a CryptoAPI message-type constant (value 1),
+	// completely unrelated to sockets.  Stomp it with the socket cmsg accessor so
+	// we can use CMSG_DATA uniformly in this file without #ifdef _WIN32 everywhere.
+	#undef CMSG_DATA
+	#define CMSG_DATA WSA_CMSG_DATA
+#endif
+
 namespace SteamNetworkingSocketsLib {
 
-inline void ETW_LongOp( const char *opName, SteamNetworkingMicroseconds usec, const char *pszInfo )
-{
-	if ( !pszInfo )
-		pszInfo = "";
-	TraceLoggingWrite(
-		HTraceLogging_SteamNetworkingSockets,
-		"LongOp",
-		TraceLoggingLevel( WINEVENT_LEVEL_WARNING ),
-		TraceLoggingUInt64( usec, "Microseconds" ),
-		TraceLoggingString( pszInfo, "ExtraInfo" )
-	);
-}
-
 constexpr int k_msMaxPollWait = 1000;
-constexpr SteamNetworkingMicroseconds k_usecMaxTimestampDelta = k_msMaxPollWait * 1100;
-
-static void FlushSystemSpew();
 
 int g_cbUDPSocketBufferSize = 256*1024;
 
@@ -109,685 +97,79 @@ int g_cbUDPSocketBufferSize = 256*1024;
 int g_nSendECNAuto = -1;
 #endif
 
-/// Global lock for all local data structures
-static Lock<RecursiveTimedMutexImpl> s_mutexGlobalLock( "global", 0, LockDebugInfo::k_nOrder_Global );
-
-#if STEAMNETWORKINGSOCKETS_LOCK_DEBUG_LEVEL > 0
-
-// By default, complain if we hold the lock for more than this long
-constexpr SteamNetworkingMicroseconds k_usecDefaultLongLockHeldWarningThreshold = 5*1000;
-
-// Debug the locks active on the cu
-struct ThreadLockDebugInfo
-{
-	static constexpr int k_nMaxHeldLocks = 8;
-	static constexpr int k_nMaxTags = 32;
-
-	int m_nHeldLocks = 0;
-	int m_nTags = 0;
-
-	SteamNetworkingMicroseconds m_usecLongLockWarningThreshold;
-	SteamNetworkingMicroseconds m_usecIgnoreLongLockWaitTimeUntil;
-	SteamNetworkingMicroseconds m_usecOuterLockStartTime; // Time when we started waiting on outermost lock (if we don't have it yet), or when we aquired the lock (if we have it)
-
-	const LockDebugInfo *m_arHeldLocks[ k_nMaxHeldLocks ];
-	struct Tag_t
-	{
-		const char *m_pszTag;
-		int m_nCount;
-	};
-	Tag_t m_arTags[ k_nMaxTags ];
-
-	inline void AddTag( const char *pszTag );
-};
-
-static void (*s_fLockAcquiredCallback)( const char *tags, SteamNetworkingMicroseconds usecWaited );
-static void (*s_fLockHeldCallback)( const char *tags, SteamNetworkingMicroseconds usecWaited );
-static SteamNetworkingMicroseconds s_usecLockWaitWarningThreshold = 2*1000;
-
-/// Get the per-thread debug info
-static ThreadLockDebugInfo &GetThreadDebugInfo()
-{
-	// Apple seems to hate thread_local.  Is there some sort of feature
-	// define a can check here?  It's a shame because it's really very
-	// efficient on MSVC, gcc, and clang on Windows and linux.
-    //
-    // Apple seems to support thread_local starting with Xcode 8.0
-	#if defined(__APPLE__) && __clang_major__ < 8
-
-		static pthread_key_t key;
-		static pthread_once_t key_once = PTHREAD_ONCE_INIT;
-
-		// One time init the TLS key
-		pthread_once( &key_once,
-			[](){ // Initialization code to run once
-				pthread_key_create(
-					&key,
-					[](void *ptr) { free(ptr); } // Destructor function
-				);
-			}
-		);
-
-		// Get current object
-		void *result = pthread_getspecific(key);
-		if ( unlikely( result == nullptr ) )
-		{
-			result = malloc( sizeof(ThreadLockDebugInfo) );
-			memset( result, 0, sizeof(ThreadLockDebugInfo) );
-			pthread_setspecific(key, result);
-		}
-		return *static_cast<ThreadLockDebugInfo *>( result );
-	#else
-
-		// Use thread_local
-		thread_local ThreadLockDebugInfo tls_lockDebugInfo;
-		return tls_lockDebugInfo;
-	#endif
-}
-
-/// If non-NULL, add a "tag" to the lock journal for the current thread.
-/// This is useful so that if we hold a lock for a long time, we can get
-/// an idea what sorts of operations were taking a long time.
-inline void ThreadLockDebugInfo::AddTag( const char *pszTag )
-{
-	if ( !pszTag )
-		return;
-
-	Assert( m_nHeldLocks > 0 ); // Can't add a tag unless we are locked!
-
-	for ( int i = 0 ; i < m_nTags ; ++i )
-	{
-		if ( m_arTags[i].m_pszTag == pszTag )
-		{
-			++m_arTags[i].m_nCount;
-			return;
-		}
-	}
-
-	if ( m_nTags >= ThreadLockDebugInfo::k_nMaxTags )
-		return;
-
-	m_arTags[ m_nTags ].m_pszTag = pszTag;
-	m_arTags[ m_nTags ].m_nCount = 1;
-	++m_nTags;
-}
-
-LockDebugInfo::~LockDebugInfo()
-{
-	// We should not be locked!  If we are, remove us
-	ThreadLockDebugInfo &t = GetThreadDebugInfo();
-	for ( int i = t.m_nHeldLocks-1 ; i >= 0 ; --i )
-	{
-		if ( t.m_arHeldLocks[i] == this )
-		{
-			AssertMsg( false, "Lock '%s' being destroyed while it is held!", m_pszName );
-			AboutToUnlock();
-		}
-	}
-}
-
-void LockDebugInfo::AboutToLock( bool bTry )
-{
-	ThreadLockDebugInfo &t = GetThreadDebugInfo();
-
-	// First lock held by this thread?
-	if ( t.m_nHeldLocks == 0 )
-	{
-		// Remember when we started trying to lock
-		t.m_usecOuterLockStartTime = SteamNetworkingSockets_GetLocalTimestamp();
-		return;
-	}
-
-	// We already hold a lock.  Check for taking locks in such a way
-	// that might lead to deadlocks.
-	const LockDebugInfo *pTopLock = t.m_arHeldLocks[ t.m_nHeldLocks-1 ];
-
-	// Taking locks in increasing order is always allowed
-	if ( likely( pTopLock->m_nOrder < m_nOrder ) )
-		return;
-
-	// Global lock *must* always be the outermost lock.  (It is legal to take other locks in
-	// between and then lock the global lock recursively.)
-	const bool bHoldGlobalLock = t.m_arHeldLocks[ 0 ] == &s_mutexGlobalLock;
-	AssertMsg(
-		bHoldGlobalLock || this != &s_mutexGlobalLock,
-		"Taking global lock while already holding lock '%s'", t.m_arHeldLocks[ 0 ]->m_pszName
-	);
-
-	// If they are only "trying", we allow out-of-order behaviour.
-	if ( bTry )
-		return;
-
-	// It's always OK to lock recursively.
-	//
-	// (Except for "short duration" locks, which are allowed to
-	// use a mutex implementation that does not support this.)
-	if ( !( m_nFlags & k_nFlag_ShortDuration ) )
-	{
-		for ( int i = 0 ; i < t.m_nHeldLocks ; ++i )
-		{
-			if ( t.m_arHeldLocks[i] == this )
-				return;
-		}
-	}
-
-	// Taking multiple object locks?  This is allowed under certain circumstances
-	if ( likely( pTopLock->m_nOrder == m_nOrder && m_nOrder == k_nOrder_ObjectOrTable ) )
-	{
-
-		// If we hold the global lock, it's OK
-		if ( bHoldGlobalLock )
-			return;
-
-		// If the global lock isn't held, then no more than one
-		// object lock is allowed, since two different threads
-		// might take them in different order.
-		constexpr int k_nObjectFlags = LockDebugInfo::k_nFlag_Connection | LockDebugInfo::k_nFlag_PollGroup;
-		if (
-			( ( m_nFlags & k_nObjectFlags ) != 0 )
-			//|| ( m_nFlags & k_nFlag_Table ) // We actually do this in one place when we know it's OK.  Not worth it right now to get this situation exempted from the checking.
-		) {
-			// We must not already hold any existing object locks (except perhaps this one)
-			for ( int i = 0 ; i < t.m_nHeldLocks ; ++i )
-			{
-				const LockDebugInfo *pOtherLock = t.m_arHeldLocks[ i ];
-				AssertMsg( pOtherLock == this || !( pOtherLock->m_nFlags & k_nObjectFlags ),
-					"Taking lock '%s' and then '%s', while not holding the global lock", pOtherLock->m_pszName, m_pszName );
-			}
-		}
-
-		// Usage is OK if we didn't find any problems above
-		return;
-	}
-
-	AssertMsg( false, "Taking lock '%s' while already holding lock '%s'", m_pszName, pTopLock->m_pszName );
-}
-
-void LockDebugInfo::OnLocked( const char *pszTag )
-{
-	ThreadLockDebugInfo &t = GetThreadDebugInfo();
-
-	Assert( t.m_nHeldLocks < ThreadLockDebugInfo::k_nMaxHeldLocks );
-	t.m_arHeldLocks[ t.m_nHeldLocks++ ] = this;
-
-	if ( t.m_nHeldLocks == 1 )
-	{
-		SteamNetworkingMicroseconds usecNow = SteamNetworkingSockets_GetLocalTimestamp();
-		SteamNetworkingMicroseconds usecTimeSpentWaitingOnLock = usecNow - t.m_usecOuterLockStartTime;
-		t.m_usecLongLockWarningThreshold = k_usecDefaultLongLockHeldWarningThreshold;
-		t.m_nTags = 0;
-
-		if ( usecTimeSpentWaitingOnLock > s_usecLockWaitWarningThreshold && usecNow > t.m_usecIgnoreLongLockWaitTimeUntil )
-		{
-			if ( pszTag )
-				SpewWarning( "Waited %.1fms for SteamNetworkingSockets lock [%s]", usecTimeSpentWaitingOnLock*1e-3, pszTag );
-			else
-				SpewWarning( "Waited %.1fms for SteamNetworkingSockets lock", usecTimeSpentWaitingOnLock*1e-3 );
-			ETW_LongOp( "lock wait", usecTimeSpentWaitingOnLock, pszTag );
-		}
-
-		auto callback = s_fLockAcquiredCallback; // save to temp, to prevent very narrow race condition where variable is cleared after we null check it, and we call null
-		if ( callback )
-			callback( pszTag, usecTimeSpentWaitingOnLock );
-
-		t.m_usecOuterLockStartTime = usecNow;
-	}
-
-	t.AddTag( pszTag );
-}
-
-void LockDebugInfo::AboutToUnlock()
-{
-	char tags[ 256 ];
-
-	SteamNetworkingMicroseconds usecElapsed = 0;
-	SteamNetworkingMicroseconds usecElapsedTooLong = 0;
-	auto lockHeldCallback = s_fLockHeldCallback;
-
-	ThreadLockDebugInfo &t = GetThreadDebugInfo();
-	Assert( t.m_nHeldLocks > 0 );
-
-	// Unlocking the last lock?
-	if ( t.m_nHeldLocks == 1 )
-	{
-
-		// We're about to do the final release.  How long did we hold the lock?
-		usecElapsed = SteamNetworkingSockets_GetLocalTimestamp() - t.m_usecOuterLockStartTime;
-
-		// Too long?  We need to check the threshold here because the threshold could
-		// change by another thread immediately after we release the lock.  Also, if
-		// we're debugging, all bets are off.  They could have hit a breakpoint, and
-		// we don't want to create a bunch of confusing spew with spurious asserts
-		if ( usecElapsed >= t.m_usecLongLockWarningThreshold && !Plat_IsInDebugSession() )
-		{
-			usecElapsedTooLong = usecElapsed;
-		}
-
-		if ( usecElapsedTooLong > 0 || lockHeldCallback )
-		{
-			char *p = tags;
-			char *end = tags + sizeof(tags) - 1;
-			for ( int i = 0 ; i < t.m_nTags && p+5 < end ; ++i )
-			{
-				if ( p > tags )
-					*(p++) = ',';
-
-				const ThreadLockDebugInfo::Tag_t &tag = t.m_arTags[i];
-				int taglen = std::min( int(end-p), (int)V_strlen( tag.m_pszTag ) );
-				memcpy( p, tag.m_pszTag, taglen );
-				p += taglen;
-
-				if ( tag.m_nCount > 1 )
-				{
-					int l = end-p;
-					if ( l <= 5 )
-						break;
-					p += V_snprintf( p, l, "(x%d)", tag.m_nCount );
-				}
-			}
-			*p = '\0';
-		}
-
-		t.m_nTags = 0;
-		t.m_usecOuterLockStartTime = 0; // Just for grins.
-	}
-
-	if ( usecElapsed > 0 && lockHeldCallback )
-	{
-		lockHeldCallback(tags, usecElapsed);
-	}
-
-	// Yelp if we held the lock for longer than the threshold.
-	if ( usecElapsedTooLong != 0 )
-	{
-		SpewWarning(
-			"SteamNetworkingSockets lock held for %.1fms.  (Performance warning.)  %s\n"
-			"This is usually a symptom of a general performance problem such as thread starvation.",
-			usecElapsedTooLong*1e-3, tags
-		);
-		ETW_LongOp( "lock held", usecElapsedTooLong, tags );
-	}
-
-	// NOTE: We are allowed to unlock out of order!  We specifically
-	// do this with the table lock!
-	for ( int i = t.m_nHeldLocks-1 ; i >= 0 ; --i )
-	{
-		if ( t.m_arHeldLocks[i] == this )
-		{
-			--t.m_nHeldLocks;
-			if ( i < t.m_nHeldLocks ) // Don't do the memmove in the common case of stack pop
-				memmove( &t.m_arHeldLocks[i], &t.m_arHeldLocks[i+1], (t.m_nHeldLocks-i) * sizeof(t.m_arHeldLocks[0]) );
-			t.m_arHeldLocks[t.m_nHeldLocks] = nullptr; // Just for grins
-			return;
-		}
-	}
-
-	AssertMsg( false, "Unlocked a lock '%s' that wasn't held?", m_pszName );
-}
-
-void LockDebugInfo::_AssertHeldByCurrentThread( const char *pszFile, int line, const char *pszTag ) const
-{
-	ThreadLockDebugInfo &t = GetThreadDebugInfo();
-	for ( int i = t.m_nHeldLocks-1 ; i >= 0 ; --i )
-	{
-		if ( t.m_arHeldLocks[i] == this )
-		{
-			t.AddTag( pszTag );
-			return;
-		}
-	}
-
-	AssertMsg( false, "%s(%d): Lock '%s' not held", pszFile, line, m_pszName );
-}
-
-void SteamNetworkingGlobalLock::SetLongLockWarningThresholdMS( const char *pszTag, int msWarningThreshold )
-{
-	AssertHeldByCurrentThread( pszTag );
-	SteamNetworkingMicroseconds usecWarningThreshold = SteamNetworkingMicroseconds{msWarningThreshold}*1000;
-	ThreadLockDebugInfo &t = GetThreadDebugInfo();
-	if ( t.m_usecLongLockWarningThreshold < usecWarningThreshold )
-	{
-		t.m_usecLongLockWarningThreshold = usecWarningThreshold;
-		t.m_usecIgnoreLongLockWaitTimeUntil = SteamNetworkingSockets_GetLocalTimestamp() + t.m_usecLongLockWarningThreshold;
-	}
-}
-
-void SteamNetworkingGlobalLock::_AssertHeldByCurrentThread( const char *pszFile, int line )
-{
-	s_mutexGlobalLock._AssertHeldByCurrentThread( pszFile, line, nullptr );
-}
-
-void SteamNetworkingGlobalLock::_AssertHeldByCurrentThread( const char *pszFile, int line, const char *pszTag )
-{
-	s_mutexGlobalLock._AssertHeldByCurrentThread( pszFile, line, pszTag );
-}
-
-#endif // #if STEAMNETWORKINGSOCKETS_LOCK_DEBUG_LEVEL > 0
-
-void SteamNetworkingGlobalLock::Lock( const char *pszTag )
-{
-	s_mutexGlobalLock.lock( pszTag );
-}
-
-bool SteamNetworkingGlobalLock::TryLock( const char *pszTag, int msTimeout )
-{
-	return s_mutexGlobalLock.try_lock_for( msTimeout, pszTag );
-}
-
-void SteamNetworkingGlobalLock::Unlock()
-{
-	s_mutexGlobalLock.unlock();
-}
-
-static void SeedWeakRandomGenerator()
-{
-
-	// Seed cheesy random number generator using true source of entropy
-	int temp;
-	CCrypto::GenerateRandomBlock( &temp, sizeof(temp) );
-	WeakRandomSeed( temp );
-}
-
-static std::atomic<long long> s_usecTimeLastReturned;
-
-// Start with an offset so that a timestamp of zero is always pretty far in the past.
-// But round it up to nice round number, so that looking at timestamps in the debugger
-// is easy to read.
-const long long k_nInitialTimestampMin = k_nMillion*24*3600*30;
-const long long k_nInitialTimestamp = 3000000000000ll;
-COMPILE_TIME_ASSERT( 2000000000000ll < k_nInitialTimestampMin );
-COMPILE_TIME_ASSERT( k_nInitialTimestampMin < k_nInitialTimestamp );
-static std::atomic<long long> s_usecTimeOffset( k_nInitialTimestamp );
-
-static std::atomic<int> s_nLowLevelSupportRefCount(0);
+std::atomic<int> s_nLowLevelSupportRefCount(0);
 static volatile bool s_bManualPollMode;
 
-/////////////////////////////////////////////////////////////////////////////
-//
-// Task lists
-//
-/////////////////////////////////////////////////////////////////////////////
-
-ShortDurationLock s_lockTaskQueue( "TaskQueue", LockDebugInfo::k_nOrder_Max ); // Never take another lock while holding this
-
-CTaskTarget::~CTaskTarget()
+int ClassifyIP( const CIPAddress &ip )
 {
-	CancelQueuedTasks();
-
-	// Set to invalid value so we will crash if we have use after free
-	m_pFirstTask = (CQueuedTask *)~(uintptr_t)0;
-}
-
-void CTaskTarget::CancelQueuedTasks()
-{
-
-	// If we have any queued tasks, we need to cancel them
-	if ( m_pFirstTask )
+	switch ( ip.GetType() )
 	{
-		ShortDurationScopeLock scopeLock( s_lockTaskQueue );
-		CQueuedTask *pTask = m_pFirstTask;
-		while ( pTask )
+		case k_EIPTypeV4:
 		{
-			CQueuedTask *pNext = pTask->m_pNextTaskForTarget;
-			Assert( !pNext || pNext->m_pPrevTaskForTarget == pTask );
-			Assert( pTask->m_pTarget == this );
-			Assert( pTask->m_eTaskState == CQueuedTask::k_ETaskState_Queued );
-			pTask->m_eTaskState = CQueuedTask::k_ETaskState_ReadyToDelete;
-			pTask->m_pTarget = nullptr;
-			pTask->m_pPrevTaskForTarget = nullptr;
-			pTask->m_pNextTaskForTarget = nullptr;
-			pTask = pNext;
-		}
-		m_pFirstTask = nullptr;
-	}
-}
-
-void CTaskList::QueueTask( CQueuedTask *pTask )
-{
-	Assert( pTask->m_eTaskState == CQueuedTask::k_ETaskState_Init );
-	Assert( !pTask->m_pPrevTaskForTarget );
-	Assert( !pTask->m_pNextTaskForTarget );
-	Assert( !pTask->m_pNextTaskInQueue );
-
-	ShortDurationScopeLock scopeLock( s_lockTaskQueue );
-
-	// If we have a target, add to list of target's tasks that need to be deleted
-	CTaskTarget *pTarget = pTask->m_pTarget;
-	if ( pTarget )
-	{
-		if ( pTarget->m_pFirstTask )
-		{
-			Assert( pTarget->m_pFirstTask->m_pPrevTaskForTarget == nullptr );
-			pTarget->m_pFirstTask->m_pPrevTaskForTarget = pTask;
-		}
-		pTask->m_pPrevTaskForTarget = nullptr;
-		pTask->m_pNextTaskForTarget = pTarget->m_pFirstTask;
-		pTarget->m_pFirstTask = pTask;
-	}
-
-	if ( m_pLastTask )
-	{
-		Assert( m_pFirstTask );
-		Assert( !m_pLastTask->m_pNextTaskInQueue );
-		m_pLastTask->m_pNextTaskInQueue = pTask;
-	}
-	else
-	{
-		Assert( !m_pFirstTask );
-		m_pFirstTask = pTask;
-	}
-
-	m_pLastTask = pTask;
-
-	// Mark task as queued
-	pTask->m_eTaskState = CQueuedTask::k_ETaskState_Queued;
-}
-
-void CTaskList::RunTasks()
-{
-	// Quick check for no tasks
-	if ( !m_pFirstTask )
-		return;
-
-	// Detach the linked list
-	s_lockTaskQueue.lock();
-	CQueuedTask *pFirstTask = m_pFirstTask;
-	m_pFirstTask = nullptr;
-	m_pLastTask = nullptr;
-	s_lockTaskQueue.unlock();
-
-	// Process items
-	CQueuedTask *pTask = pFirstTask;
-	while ( pTask )
-	{
-
-		// We might have to loop due to lock contention
-		for (;;)
-		{
-
-			// Already deleted?
-			if ( pTask->m_eTaskState != CQueuedTask::k_ETaskState_Queued )
+			uint32 ipv4 = ip.GetIPv4();  // host order: first octet in bits 31-24
+			uint8 a = (uint8)( ipv4 >> 24 );
+			uint8 b = (uint8)( ipv4 >> 16 );
+			if ( TEST_mocknetwork_active )
 			{
-				Assert( pTask->m_eTaskState == CQueuedTask::k_ETaskState_ReadyToDelete );
-				Assert( pTask->m_pTarget == nullptr );
-				break;
-			}
-
-			ShortDurationScopeLock scopeLock;
-
-			// We'll need to lock the queue if they have a target.
-			// If their target does not have a locking mechanism, then we
-			// assume that it cannot be deleted here.  However, we always need
-			// to protect against other tasks getting queued against the target,
-			// and we allow that to be done without locking the target.
-			if ( pTask->m_pTarget )
-				scopeLock.Lock( s_lockTaskQueue );
-
-// FIXME - has not been tested, and also does not have a good mechanism for unlocking.
-//			// Do we have a lock we need to take?
-//			if ( pTask->m_lockFunc )
-//			{
-//
-//				int msTimeOut = 10;
-//				if ( pTask->m_pTarget )
-//				{
-//					scopeLock.Lock( s_lockTaskQueue );
-//
-//					// Deleted while we locked?
-//					if ( pTask->m_eTaskState != CQueuedTask::k_ETaskState_Queued )
-//					{
-//						Assert( pTask->m_eTaskState == CQueuedTask::k_ETaskState_ReadyToDelete );
-//						Assert( pTask->m_pTarget == nullptr );
-//						break;
-//					}
-//
-//					// Use a short timeout and loop, in case we might deadlock
-//					msTimeOut = 1;
-//				}
-//
-//				if ( !(*pTask->m_lockFunc)( pTask->m_lockFuncArg, msTimeOut, pTask->m_pszTag ) )
-//				{
-//					// Other object is busy, or perhaps we are deadlocked?
-//					continue;
-//				}
-//
-//				// Deleted while we locked?
-//				if ( pTask->m_eTaskState != CQueuedTask::k_ETaskState_Queued )
-//				{
-//					Assert( pTask->m_eTaskState == CQueuedTask::k_ETaskState_ReadyToDelete );
-//					Assert( pTask->m_pTarget == nullptr );
-//					break;
-//				}
-//			}
-
-			// OK, we've got the locks we need and are ready to run.
-			// Unlink from the target, if we have one
-			CTaskTarget *pTarget = pTask->m_pTarget;
-			if ( pTarget )
-			{
-				CQueuedTask *p = pTask->m_pPrevTaskForTarget;
-				CQueuedTask *n = pTask->m_pNextTaskForTarget;
-				if ( p )
+				// All mock IPv4 addresses are 127.0.X.x.
+				// Third octet == 100 is the simulated public internet; everything else is a private LAN.
+				if ( a == 127 )
 				{
-					Assert( p->m_pTarget == pTarget );
-					Assert( p->m_pNextTaskForTarget == pTask );
-					p->m_pNextTaskForTarget = n;
-					pTask->m_pPrevTaskForTarget = nullptr;
+					if ( (ipv4 & 0xFF00) == (100 << 8) )
+						return k_nIPClassify_IPv4 | k_nIPClassify_Mock | k_nIPClassify_Public;
+					return k_nIPClassify_IPv4 | k_nIPClassify_Mock | k_nIPClassify_LAN;
 				}
-				else
-				{
-					Assert( pTarget->m_pFirstTask == pTask );
-					pTarget->m_pFirstTask = n;
-				}
-				if ( n )
-				{
-					Assert( n->m_pPrevTaskForTarget == pTask );
-					n->m_pPrevTaskForTarget = p;
-					pTask->m_pNextTaskForTarget = nullptr;
-				}
-
-				// Note: we must leave the target pointer set
+				// Not a mock address -- invalid in mock mode
+				return 0;
 			}
-
-			// We can release this lock now if we took it
-			scopeLock.Unlock();
-
-			// !KLUDGE! Deluxe
-			if ( this == &g_taskListRunWithGlobalLock )
-			{
-				// Make sure we hold the lock, and also set the tag for debugging purposes
-				SteamNetworkingGlobalLock::AssertHeldByCurrentThread( pTask->m_pszTag );
-			}
-
-			// Run the task
-			pTask->m_eTaskState = CQueuedTask::k_ETaskState_Running;
-			pTask->Run();
-
-			// Mark us as finished
-			pTask->m_eTaskState = CQueuedTask::k_ETaskState_ReadyToDelete;
-			pTask->m_pTarget = nullptr;
-			break;
+			if ( a == 127 )
+				return k_nIPClassify_IPv4 | k_nIPClassify_Localhost;
+			if ( a == 10
+				|| ( a == 172 && b >= 16 && b <= 31 )
+				|| ( a == 192 && b == 168 )
+				|| ( a == 169 && b == 254 ) )
+				return k_nIPClassify_IPv4 | k_nIPClassify_LAN;
+			return k_nIPClassify_IPv4 | k_nIPClassify_Public;
 		}
 
-		// Done, we can delete the task
-		CQueuedTask *pNext = pTask->m_pNextTaskInQueue;
-		pTask->m_pNextTaskInQueue = nullptr;
-		delete pTask;
-		pTask = pNext;
-	}
-}
-
-CTaskList g_taskListRunWithGlobalLock;
-CTaskList g_taskListRunInBackground;
-
-CQueuedTask::~CQueuedTask()
-{
-	Assert( m_eTaskState == k_ETaskState_Init || m_eTaskState == k_ETaskState_ReadyToDelete );
-	Assert( !m_pNextTaskInQueue );
-	Assert( !m_pPrevTaskForTarget );
-	Assert( !m_pNextTaskForTarget );
-}
-
-void CQueuedTask::SetTarget( CTaskTarget *pTarget )
-{
-	// Can only call this once
-	Assert( m_eTaskState == k_ETaskState_Init );
-	Assert( m_pTarget == nullptr );
-	m_pTarget = pTarget;
-
-	// NOTE: We wait to link task to the target until we actually queue it
-}
-
-bool CQueuedTask::RunWithGlobalLockOrQueue( const char *pszTag )
-{
-	Assert( m_eTaskState == k_ETaskState_Init );
-	Assert( m_lockFunc == nullptr );
-
-	// Check if lock is available immediately
-	if ( !SteamNetworkingGlobalLock::TryLock( pszTag, 0 ) )
-	{
-		QueueToRunWithGlobalLock( pszTag );
-		return false;
+		case k_EIPTypeV6:
+		{
+			const uint8 *b = ip.GetIPV6Bytes();
+			if ( TEST_mocknetwork_active )
+			{
+				// All mock IPv6 addresses are fd7f:0:X::.
+				// Net ID 0x0100 (bytes 4-5 = {0x01, 0x00}) is the simulated public internet.
+				if ( b[0] == 0xfd && b[1] == 0x7f && b[2] == 0x00 && b[3] == 0x00 )
+				{
+					if ( b[4] == 0x01 && b[5] == 0x00 )
+						return k_nIPClassify_IPv6 | k_nIPClassify_Mock | k_nIPClassify_Public;
+					return k_nIPClassify_IPv6 | k_nIPClassify_Mock | k_nIPClassify_LAN;
+				}
+				// Not a mock address -- invalid in mock mode
+				return 0;
+			}
+			// ::1 (loopback) should never appear in non-mock mode
+			if ( memcmp( b, k_ipv6Bytes_Loopback, 16 ) == 0 )
+				return k_nIPClassify_IPv6 | k_nIPClassify_Localhost;
+			if ( (b[0] & 0xfe) == 0xfc )  // fc00::/7 -- ULA private space
+				return k_nIPClassify_IPv6 | k_nIPClassify_LAN;
+			if ( b[0] == 0xfe && (b[1] & 0xc0) == 0x80 )  // fe80::/10 -- link-local
+				return k_nIPClassify_IPv6 | k_nIPClassify_LAN;
+			return k_nIPClassify_IPv6 | k_nIPClassify_Public;
+		}
 	}
 
-	// Service the queue so we always do items in order
-	g_taskListRunWithGlobalLock.RunTasks();
-
-	// Let derived class do work
-	m_eTaskState = k_ETaskState_Running;
-	Run();
-
-	// Go ahead and unlock now
-	SteamNetworkingGlobalLock::Unlock();
-
-	// Self destruct
-	m_eTaskState = k_ETaskState_ReadyToDelete;
-	m_pTarget = nullptr;
-	delete this;
-
-	// We have run
-	return true;
+	AssertMsg( false, "Invalid IP type %d", ip.GetType() );
+	return 0;
 }
 
-void CQueuedTask::QueueToRunWithGlobalLock( const char *pszTag )
+int ClassifyIP( const SteamNetworkingIPAddr &ip )
 {
-	Assert( m_lockFunc == nullptr );
-	if ( pszTag )
-		m_pszTag = pszTag;
-	g_taskListRunWithGlobalLock.QueueTask( this );
-
-	// Make sure service thread will wake up to do something with this
-	WakeServiceThread();
-
-	// NOTE: At this point we are subject to being run or deleted at any time!
-}
-
-void CQueuedTask::QueueToRunInBackground()
-{
-	g_taskListRunInBackground.QueueTask( this );
-
-	//if ( s_bManualPollMode || ( s_pServiceThread && s_pServiceThread->get_id() != std::this_thread::get_id() ) )
-	WakeServiceThread();
+	// FIXME We really should just get rid of all of our internal uses of the
+	// SteamNetworkingIPAddr type, and only use it for the API
+	netadr_t adr;
+	SteamNetworkingIPAddrToNetAdr( adr, ip );
+	return ClassifyIP( adr );
 }
 
 // Try to guess if the route the specified address is probably "local".
@@ -797,6 +179,14 @@ void CQueuedTask::QueueToRunInBackground()
 // False negatives: We can't always tell if a route is local.
 bool IsRouteToAddressProbablyLocal( netadr_t addr )
 {
+	int nClassify = ClassifyIP( addr );
+	if ( nClassify & k_nIPClassify_Public )
+		return false;  // public internet (real or mock-simulated) is never local
+	if ( nClassify & ( k_nIPClassify_LAN | k_nIPClassify_Localhost ) )
+		return true;
+
+	// ClassifyIP returned 0 (unrecognised address in mock mode, or invalid type).
+	// Fall through to the OS-level check for real addresses.
 
 	// Assume that if we are able to send to any "reserved" route, that is is local.
 	// Note that this will be true for VPNs, too!
@@ -1008,6 +398,10 @@ public:
 
 	#if defined( _WIN32 ) && PlatformSupportsRecvMsg()
 		LPFN_WSARECVMSG m_pfnWSARecvMsg = nullptr;
+	#endif
+
+	#if PlatformSupportsRecvTOS()
+		bool m_bWarnIfNoTOSCMsg = false;
 	#endif
 
 	// Implements IRawUDPSocket
@@ -1788,7 +1182,7 @@ void WakeServiceThread()
 inline SteamNetworkingMicroseconds RandomJitter( const GlobalConfigValue<float> &ValAvg, const GlobalConfigValue<float> &ValMax, const GlobalConfigValue<float> &ValPct )
 {
 	// The defaults disable jitter by setting the *average* to 0, so check that first.
-	if ( likely( ValAvg.Get() ) <= 0.0f )
+	if ( likely( ValAvg.Get() <= 0.0f ) )
 		return 0;
 	if ( ValMax.Get() <= 0.0f )
 		return 0;
@@ -2094,30 +1488,6 @@ static SOCKET OpenUDPSocketBoundToSockAddr( const void *pSockaddr, size_t len, S
 		#endif
 	}
 
-	// Enable receiving of the ToS field in the ancillary data
-	#if PlatformSupportsRecvTOS()
-	{
-		opt = 1;
-
-		// Apple uses a different field to receive this for IPv6
-		#if defined(__APPLE__)
-		if ( inaddr->sin_family == AF_INET6 )
-		{
-			if ( setsockopt( sock, IPPROTO_IPV6, IPV6_RECVTCLASS, (char *)&opt, sizeof(opt) ) == -1 )
-			{
-				SpewWarning( "sockopt(IPPROTO_IPV6, IPV6_RECVTCLASS, 1) failed (0x%x), will not be able to read TOS\n", GetLastSocketError() );
-			}
-		} else
-		#endif
-		{
-			if ( setsockopt( sock, IPPROTO_IP, IP_RECVTOS, (char *)&opt, sizeof(opt) ) == -1 )
-			{
-				SpewWarning( "sockopt(IPPROTO_IP, IP_RECVTOS, 1) failed (0x%x), will not be able to read TOS\n", GetLastSocketError() );
-			}
-		}
-	}
-	#endif
-
 	// Bind it to specific desired local port/IP
 	if ( bind( sock, (struct sockaddr *)pSockaddr, (socklen_t)len ) == -1 )
 	{
@@ -2140,7 +1510,7 @@ static CRawUDPSocketImpl *OpenRawUDPSocketInternal( CRecvPacketCallback callback
 	if ( s_nLowLevelSupportRefCount.load(std::memory_order_acquire) <= 0 )
 	{
 		V_strcpy_safe( errMsg, "Internal order of operations bug.  Can't create socket, because low level systems not initialized" );
-		AssertMsg( false, errMsg );
+		AssertMsgFormatted( false, errMsg );
 		return nullptr;
 	}
 
@@ -2317,6 +1687,84 @@ static CRawUDPSocketImpl *OpenRawUDPSocketInternal( CRecvPacketCallback callback
 	}
 	#endif
 
+	// Enable receiving TOS/traffic class in ancillary data, and record whether it succeeded.
+	//
+	// Platform/family matrix:
+	//
+	// Windows AF_INET6 (incl. dual-stack): IPV6_RECVTCLASS covers pure IPv6 packets.
+	//   For IPv4-mapped packets on dual-stack sockets, IP_RECVTOS also works and returns
+	//   IP_TOS cmsg (Windows does NOT automatically map IPv4 TOS into IPV6_TCLASS).
+	//   Both sockopts should be set; IP_RECVTOS failure is silently ignored in case
+	//   a future Windows version rejects it.
+	//
+	// Apple AF_INET6: IPV6_RECVTCLASS covers both families (Apple does map IPv4 TOS
+	//   into the IPv6 traffic-class field for IPv4-mapped packets).
+	//
+	// Linux AF_INET6 dual-stack: both sockopts must be set.  IP_RECVTOS covers IPv4-mapped
+	//   packets (returns IPPROTO_IP/IP_TOS); IPV6_RECVTCLASS covers pure IPv6 (returns
+	//   IPPROTO_IPV6/IPV6_TCLASS).  Unlike Apple, Linux does NOT map one to the other.
+	//
+	// Linux AF_INET6 IPv6-only: only IPV6_RECVTCLASS is needed (no IPv4-mapped packets).
+	//
+	// All platforms AF_INET: IP_RECVTOS only.
+	#if PlatformSupportsRecvTOS()
+	{
+		unsigned int opt = 1;
+		pSock->m_bWarnIfNoTOSCMsg = false;
+
+		bool use_IPv4_RECVTOS = true;
+		if ( addrBound.ss_family == AF_INET6 )
+		{
+			#if defined( __APPLE__ )
+				if ( setsockopt( sock, IPPROTO_IPV6, IPV6_RECVTCLASS, (char *)&opt, sizeof(opt) ) == -1 )
+					SpewWarning( "sockopt(IPPROTO_IPV6, IPV6_RECVTCLASS, 1) failed (0x%x), will not be able to read TOS\n", GetLastSocketError() );
+				else
+					pSock->m_bWarnIfNoTOSCMsg = true;
+
+				// Apple maps IPv4 TOS into the IPv6 traffic-class field for IPv4-mapped packets,
+				// so one sockopt covers both families.
+				use_IPv4_RECVTOS = false;
+			#else
+				if ( setsockopt( sock, IPPROTO_IPV6, IPV6_RECVTCLASS, (char *)&opt, sizeof(opt) ) == -1 )
+					SpewWarning( "sockopt(IPPROTO_IPV6, IPV6_RECVTCLASS, 1) failed (0x%x), will not be able to read TOS for IPv6 packets\n", GetLastSocketError() );
+				else
+					pSock->m_bWarnIfNoTOSCMsg = true;
+
+				// Linux and Windows: dual-stack sockets need IP_RECVTOS for IPv4-mapped packets
+				// (neither platform maps IPv4 TOS into IPV6_TCLASS automatically).
+				// Skip only for IPv6-only sockets where no IPv4-mapped packets can arrive.
+				if ( !( pSock->m_nAddressFamilies & k_nAddressFamily_IPv4 ) )
+					use_IPv4_RECVTOS = false;
+			#endif
+		}
+
+		if ( use_IPv4_RECVTOS )
+		{
+			if ( setsockopt( sock, IPPROTO_IP, IP_RECVTOS, (char *)&opt, sizeof(opt) ) == -1 )
+			{
+				#ifdef _WIN32
+				// On Windows AF_INET6, IP_RECVTOS may not be supported on all versions;
+				// failure is non-fatal since IPV6_RECVTCLASS handles pure IPv6 packets.
+				if ( addrBound.ss_family == AF_INET6 )
+				{
+					// Don't complain if we fail to read back TOS on mapped IPv4 packets.
+					// We will still be able to read TOS on pure IPv6 packets
+					pSock->m_bWarnIfNoTOSCMsg = false;
+				}
+				else
+				#endif
+				{
+					SpewWarning( "sockopt(IPPROTO_IP, IP_RECVTOS, 1) failed (0x%x), will not be able to read TOS\n", GetLastSocketError() );
+				}
+			}
+			else
+			{
+				pSock->m_bWarnIfNoTOSCMsg = true;
+			}
+		}
+	}
+	#endif
+
 	// Add to master list.  (Hopefully we usually won't have that many.)
 	s_vecRawSockets.AddToTail( pSock );
 
@@ -2332,17 +1780,510 @@ static CRawUDPSocketImpl *OpenRawUDPSocketInternal( CRecvPacketCallback callback
 	return pSock;
 }
 
-IRawUDPSocket *OpenRawUDPSocket( CRecvPacketCallback callback, SteamNetworkingErrMsg &errMsg, SteamNetworkingIPAddr *pAddrLocal, int *pnAddressFamilies )
+#if STEAMNETWORKINGSOCKETS_ENABLE_MOCK
+
+#include <algorithm>
+#include <memory>
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Mock network
+//
+/////////////////////////////////////////////////////////////////////////////
+
+// Config supplied by TEST_mocknetwork_init(); valid when TEST_mocknetwork_active == true
+static TEST_mocknetwork_config_t s_mockNetworkConfig;
+
+// Third octet identifies the network in 127.0.X.Y addressing.
+// Third octet = 100 means public/gateway network (127.0.100.x)
+const uint32 k_nMockPublicIPv4Net = (100 << 8);
+
+// IPv6 mock addresses use fd7f:0:X::Y.  Groups [4:6] (bytes 4-5) identify the network,
+// mirroring the IPv4 third-octet scheme.  0x0100 ("100" in hex) = public network.
+const uint16 k_nMockPublicIPv6NetID = 0x0100;
+
+// Returns the network ID from bytes [4:6] of a mock IPv6 address (fd7f:0:X::Y),
+// or 0 if the address is not in the mock IPv6 range.
+static inline uint16 GetMockIPv6NetID( const uint8 *b )
 {
-	return OpenRawUDPSocketInternal( callback, errMsg, pAddrLocal, pnAddressFamilies );
+	if ( b[0] != 0xfd || b[1] != 0x7f || b[2] != 0x00 || b[3] != 0x00 )
+		return 0;
+	return ( uint16(b[4]) << 8 ) | b[5];
 }
 
-static inline void AssertGlobalLockHeldExactlyOnce()
+// Custom implementation of IRawUDPSocket that applies the appropriate routing
+// rules from the mocked network environment
+class CUDPSocketMock : public IRawUDPSocket
 {
-	#if STEAMNETWORKINGSOCKETS_LOCK_DEBUG_LEVEL > 0
-		ThreadLockDebugInfo &t = GetThreadDebugInfo();
-		Assert( t.m_nHeldLocks == 1 && t.m_arHeldLocks[0] == &s_mutexGlobalLock );
+public:
+
+	bool BindLocal( CRecvPacketCallback userCallback, SteamNetworkingErrMsg &errMsg, const SteamNetworkingIPAddr &addrLocal )
+	{
+		Assert( !m_pSockLocal );
+		m_userCallback = userCallback;
+		m_pSockLocal = OpenRawUDPSocketInternal( { StaticRecvInternalPacketThunk, this }, errMsg, &addrLocal, nullptr );
+		if ( !m_pSockLocal )
+			return false;
+		m_boundAddr = m_pSockLocal->m_boundAddr;
+		return true;
+	}
+
+	virtual void SetCallbackRecvPacket( CRecvPacketCallback callback ) override
+	{
+		m_userCallback = callback;
+	}
+
+	// Implements IRawUDPSocket
+	virtual bool BSendRawPacketGather( int nChunks, const iovec *pChunks, const netadr_t &adrTo, int ecn = -1 ) const override final
+	{
+		if ( !m_pSockLocal )
+			return false;
+
+		// Drop all packets if this interface is disabled
+		if ( !m_ifaceConfig.m_bEnabled )
+			return true;
+
+		// Simulate packet loss on this interface
+		if ( m_ifaceConfig.m_nSendLossPct > 0 && RandomBoolWithOdds( m_ifaceConfig.m_nSendLossPct ) )
+			return true;
+
+		DbgAssert( m_boundAddr == m_pSockLocal->m_boundAddr );
+
+		int nClassify = ClassifyIP( adrTo );
+		if ( nClassify == 0 )
+			return false;  // not a mock address
+
+		if ( adrTo.GetType() == k_EIPTypeV4 )
+		{
+			if ( !m_boundAddr.IsIPv4() )
+			{
+				// Can't send to IPv4 address if we don't have an IPv4 socket
+				return false;
+			}
+			Assert( m_pSockLocal->m_nAddressFamilies & k_nAddressFamily_IPv4 );
+
+			// Public mock address -- route via NAT (the gateway does the NATting)
+			if ( nClassify & k_nIPClassify_Public )
+				return const_cast<CUDPSocketMock *>(this)->BCreateNATAndSend( nChunks, pChunks, adrTo, ecn );
+
+			// Private mock LAN: deliver directly only if on the same /24 subnet
+			const uint32 net_remote = adrTo.GetIPv4() & 0xFF00;
+			const uint32 net_local  = m_boundAddr.GetIPv4() & 0xFF00;
+			if ( net_local == net_remote )
+			{
+				// Same LAN -- send directly with interface latency only (no gateway involved)
+				return SendDelayed( m_pSockLocal, nChunks, pChunks, adrTo, ecn, m_ifaceConfig.m_nSendLatencyMS );
+			}
+		}
+		else if ( adrTo.GetType() == k_EIPTypeV6 )
+		{
+			if ( m_boundAddr.IsIPv4() )
+			{
+				// Can't send to IPv6 address from an IPv4 socket
+				return false;
+			}
+
+			// Public mock address -- route via NAT
+			if ( nClassify & k_nIPClassify_Public )
+				return const_cast<CUDPSocketMock *>(this)->BCreateNATAndSend( nChunks, pChunks, adrTo, ecn );
+
+			// Private mock LAN: deliver directly only if on the same /112 subnet
+			const uint16 net_remote = GetMockIPv6NetID( adrTo.GetIPV6Bytes() );
+			const uint16 net_local  = GetMockIPv6NetID( m_ifaceConfig.m_ip.m_ipv6 );
+			if ( net_local == net_remote )
+			{
+				// Same LAN -- send directly
+				return SendDelayed( m_pSockLocal, nChunks, pChunks, adrTo, ecn, m_ifaceConfig.m_nSendLatencyMS );
+			}
+		}
+
+		// No route
+		return false;
+	}
+
+	virtual void Close() override
+	{
+		if ( m_pSockLocal )
+		{
+			m_pSockLocal->Close();
+			m_pSockLocal = nullptr;
+		}
+		// Mock sockets are not tracked by s_vecRawSockets, so they must
+		// self-delete here, mirroring how real socket Close() ends with
+		// the object being destroyed (just deferred via the cleanup queue).
+		delete this;
+	}
+
+protected:
+
+	TEST_mocknetwork_interface_t m_ifaceConfig;
+	const TEST_mocknetwork_gateway_t *m_pGatewayConfig; // null for public interfaces (no NAT)
+
+	CUDPSocketMock( const TEST_mocknetwork_interface_t &ifaceConfig, const TEST_mocknetwork_gateway_t *pGatewayConfig )
+		: m_ifaceConfig( ifaceConfig ), m_pGatewayConfig( pGatewayConfig ) {}
+
+	// Total one-way latency for packets going to the public internet via this interface.
+	// Sums interface send latency + gateway internal latency (VPN tunnel) + gateway external latency (WAN).
+	int GetPublicSendLatencyMS() const
+	{
+		int ms = m_ifaceConfig.m_nSendLatencyMS;
+		if ( m_pGatewayConfig )
+			ms += m_pGatewayConfig->m_nInternalLatencyMS + m_pGatewayConfig->m_nExternalLatencyMS;
+		return ms;
+	}
+
+	// The internal (LAN-side) socket
+	CRawUDPSocketImpl *m_pSockLocal = nullptr;
+
+	// The user-provided callback, kept separately so we can wrap it
+	CRecvPacketCallback m_userCallback;
+
+	// Derived classes override this to apply NAT rules
+	virtual bool BCreateNATAndSend( int nChunks, const iovec *pChunks, const netadr_t &adrTo, int ecn ) = 0;
+
+	// Forward a packet received on an external (public) port to the user callback.
+	// Fixes up info.m_pSock to point to this mock socket so replies route correctly.
+	void DispatchExternalPacket( const RecvPktInfo_t &info )
+	{
+		if ( !m_userCallback.m_fnCallback )
+			return;
+		if ( m_pGatewayConfig && m_pGatewayConfig->m_nInternalLatencyMS > 0 )
+		{
+			iovec iov_buf;
+			iov_buf.iov_base = (void *)info.m_pPkt;
+			iov_buf.iov_len = info.m_cbPkt;
+			SteamNetworkingMicroseconds usecDeliverAt = SteamNetworkingSockets_GetLocalTimestamp() + (SteamNetworkingMicroseconds)m_pGatewayConfig->m_nInternalLatencyMS * 1000;
+			s_packetLagQueueRecv.LagPacket( m_pSockLocal, info.m_adrFrom, usecDeliverAt, 1, &iov_buf, info.m_tos );
+			return;
+		}
+		RecvPktInfo_t fixedInfo = info;
+		fixedInfo.m_pSock = this;
+		m_userCallback( fixedInfo );
+	}
+
+	// Allocate a port on this interface's gateway public IP for a NAT entry
+	CRawUDPSocketImpl *CreateExternalSock( CRecvPacketCallback callback )
+	{
+		Assert( m_pGatewayConfig );
+		Assert( m_pGatewayConfig->m_public_ip.m_port == 0 );
+		SteamNetworkingIPAddr addrGateway = m_pGatewayConfig->m_public_ip;
+		SteamNetworkingErrMsg errMsg;
+		CRawUDPSocketImpl *pSock = OpenRawUDPSocketInternal( callback, errMsg, &addrGateway, nullptr );
+		if ( !pSock )
+			SpewError( "Failed to create external socket for NAT.  %s\n", errMsg );
+		return pSock;
+	}
+
+	// Send a packet, optionally delaying delivery by nDelayMS milliseconds.
+	// NAT bookkeeping must be completed before calling this; only the wire send is delayed.
+	bool SendDelayed( CRawUDPSocketImpl *pSock, int nChunks, const iovec *pChunks, const netadr_t &adrTo, int ecn, int nDelayMS ) const
+	{
+		if ( nDelayMS <= 0 )
+			return pSock->BSendRawPacketGather( nChunks, pChunks, adrTo, ecn );
+
+		SteamNetworkingMicroseconds usecDeliverAt = SteamNetworkingSockets_GetLocalTimestamp() + (SteamNetworkingMicroseconds)nDelayMS * 1000;
+		s_packetLagQueueSend.LagPacket( pSock, adrTo, usecDeliverAt, nChunks, pChunks, ecn == -1 ? 0xff : (uint8)ecn );
+		return true;
+	}
+
+private:
+	static void StaticRecvInternalPacketThunk( const RecvPktInfo_t &info, CUDPSocketMock *pSelf )
+	{
+		if ( !pSelf->m_ifaceConfig.m_bEnabled )
+			return;
+		// Fix up m_pSock to point to this mock socket, not the internal one, so replies route correctly
+		RecvPktInfo_t fixedInfo = info;
+		fixedInfo.m_pSock = pSelf;
+		pSelf->m_userCallback( fixedInfo );
+	}
+};
+
+// Public interface -- local IP is already on the public network, no NAT
+class CUDPSocketMock_Public final : public CUDPSocketMock
+{
+public:
+	CUDPSocketMock_Public( const TEST_mocknetwork_interface_t &iface )
+		: CUDPSocketMock( iface, nullptr ) {}
+
+	virtual bool BCreateNATAndSend( int nChunks, const iovec *pChunks, const netadr_t &adrTo, int ecn ) override
+	{
+		return SendDelayed( m_pSockLocal, nChunks, pChunks, adrTo, ecn, m_ifaceConfig.m_nSendLatencyMS );
+	}
+};
+
+// FullCone, RestrictedCone, and PortRestrictedCone all map one internal port to one external
+// port.  They differ only in which inbound packets are allowed.
+class CUDPSocketMock_OnePublicPort final : public CUDPSocketMock
+{
+public:
+	CUDPSocketMock_OnePublicPort( const TEST_mocknetwork_interface_t &iface, const TEST_mocknetwork_gateway_t &gw )
+		: CUDPSocketMock( iface, &gw )
+	{
+		Assert( gw.m_natType == TEST_mocknetwork_nat_type::FullCone
+			|| gw.m_natType == TEST_mocknetwork_nat_type::RestrictedCone
+			|| gw.m_natType == TEST_mocknetwork_nat_type::PortRestrictedCone );
+	}
+
+	virtual void Close() override
+	{
+		if ( m_pSockExternal )
+		{
+			m_pSockExternal->Close();
+			m_pSockExternal = nullptr;
+		}
+		CUDPSocketMock::Close();
+	}
+
+private:
+
+	CRawUDPSocketImpl *m_pSockExternal = nullptr;
+	std::vector<netadr_t> m_vecAdrsSentTo;
+
+	static void StaticRecvPacketThunk( const RecvPktInfo_t &info, CUDPSocketMock_OnePublicPort *self )
+	{
+		self->RecvPacketExternal( info );
+	}
+
+	virtual bool BCreateNATAndSend( int nChunks, const iovec *pChunks, const netadr_t &adrTo, int ecn ) override
+	{
+		// Create the external socket on first send
+		if ( !m_pSockExternal )
+		{
+			m_pSockExternal = CreateExternalSock( { StaticRecvPacketThunk, this } );
+			if ( !m_pSockExternal )
+				return false;
+
+			SpewVerbose( "[MOCK NAT] Created  [internal %s] <-> [public %s] <-> (any)\n",
+				SteamNetworkingIPAddrRender( m_pSockLocal->m_boundAddr ).c_str(),
+				SteamNetworkingIPAddrRender( m_pSockExternal->m_boundAddr ).c_str() );
+		}
+
+		// Track destinations for restricted NAT types
+		TEST_mocknetwork_nat_type eNATType = m_pGatewayConfig->m_natType;
+		if ( eNATType != TEST_mocknetwork_nat_type::FullCone )
+		{
+			netadr_t adrRecordSent = adrTo;
+			if ( eNATType == TEST_mocknetwork_nat_type::RestrictedCone )
+				adrRecordSent.SetPort(0);
+			if ( std::find( m_vecAdrsSentTo.begin(), m_vecAdrsSentTo.end(), adrRecordSent ) == m_vecAdrsSentTo.end() )
+				m_vecAdrsSentTo.push_back( adrRecordSent );
+		}
+
+		return SendDelayed( m_pSockExternal, nChunks, pChunks, adrTo, ecn, GetPublicSendLatencyMS() );
+	}
+
+	void RecvPacketExternal( const RecvPktInfo_t &info )
+	{
+		// For restricted NAT types, drop packets from addresses we haven't sent to
+		TEST_mocknetwork_nat_type eNATType = m_pGatewayConfig->m_natType;
+		if ( eNATType != TEST_mocknetwork_nat_type::FullCone )
+		{
+			netadr_t adrCheck = info.m_adrFrom;
+			if ( eNATType == TEST_mocknetwork_nat_type::RestrictedCone )
+				adrCheck.SetPort(0);
+			if ( std::find( m_vecAdrsSentTo.begin(), m_vecAdrsSentTo.end(), adrCheck ) == m_vecAdrsSentTo.end() )
+			{
+				SpewVerbose( "[MOCK NAT] Dropped  [public %s] <- [remote %s]\n",
+					SteamNetworkingIPAddrRender( m_pSockExternal->m_boundAddr ).c_str(),
+					CUtlNetAdrRender( info.m_adrFrom ).String() );
+				return;
+			}
+		}
+
+		DispatchExternalPacket( info );
+	}
+};
+
+// Symmetric NAT: every unique remote destination gets a separate external port
+class CUDPSocketMock_Symmetric final : public CUDPSocketMock
+{
+public:
+	CUDPSocketMock_Symmetric( const TEST_mocknetwork_interface_t &iface, const TEST_mocknetwork_gateway_t &gw )
+		: CUDPSocketMock( iface, &gw ) {}
+
+	virtual void Close() override
+	{
+		m_vecNATEntries.clear();  // NATEntry_t destructor closes external sockets
+		CUDPSocketMock::Close();
+	}
+
+private:
+
+	struct NATEntry_t
+	{
+		CUDPSocketMock_Symmetric *m_pOwner = nullptr;
+		netadr_t m_adrRemote;
+		CRawUDPSocketImpl *m_pSockExternal = nullptr;
+		~NATEntry_t()
+		{
+			if ( m_pSockExternal )
+			{
+				m_pSockExternal->Close();
+				m_pSockExternal = nullptr;
+			}
+		}
+	};
+	std::vector<std::unique_ptr<NATEntry_t>> m_vecNATEntries;
+
+	static void StaticRecvPacketThunk( const RecvPktInfo_t &info, NATEntry_t *pEntry )
+	{
+		if ( pEntry->m_adrRemote != info.m_adrFrom )
+		{
+			SpewVerbose( "[MOCK NAT] Dropped  [public %s] <- [remote %s] (expected %s)\n",
+				SteamNetworkingIPAddrRender( pEntry->m_pSockExternal->m_boundAddr ).c_str(),
+				CUtlNetAdrRender( info.m_adrFrom ).String(),
+				CUtlNetAdrRender( pEntry->m_adrRemote ).String() );
+			return;
+		}
+		pEntry->m_pOwner->DispatchExternalPacket( info );
+	}
+
+	virtual bool BCreateNATAndSend( int nChunks, const iovec *pChunks, const netadr_t &adrTo, int ecn ) override
+	{
+		// Find existing NAT entry for this remote address
+		NATEntry_t *pNatEntry = nullptr;
+		for ( const auto &pEntry : m_vecNATEntries )
+		{
+			if ( pEntry->m_adrRemote == adrTo )
+			{
+				pNatEntry = pEntry.get();
+				break;
+			}
+		}
+
+		if ( !pNatEntry )
+		{
+			auto pNewEntry = std::make_unique<NATEntry_t>();
+			pNewEntry->m_pOwner = this;
+			pNewEntry->m_adrRemote = adrTo;
+
+			pNewEntry->m_pSockExternal = CreateExternalSock( { StaticRecvPacketThunk, pNewEntry.get() } );
+			if ( !pNewEntry->m_pSockExternal )
+				return false;
+
+			SpewVerbose( "[MOCK NAT] Created  [internal %s] <-> [public %s] <-> [remote %s]\n",
+				SteamNetworkingIPAddrRender( m_pSockLocal->m_boundAddr ).c_str(),
+				SteamNetworkingIPAddrRender( pNewEntry->m_pSockExternal->m_boundAddr ).c_str(),
+				CUtlNetAdrRender( adrTo ).String() );
+
+			pNatEntry = pNewEntry.get();
+			m_vecNATEntries.push_back( std::move( pNewEntry ) );
+		}
+
+		return SendDelayed( pNatEntry->m_pSockExternal, nChunks, pChunks, adrTo, ecn, GetPublicSendLatencyMS() );
+	}
+};
+
+#endif // STEAMNETWORKINGSOCKETS_ENABLE_MOCK
+
+
+IRawUDPSocket *OpenRawUDPSocket( CRecvPacketCallback callback, SteamNetworkingErrMsg &errMsg, SteamNetworkingIPAddr *pAddrLocal, int *pnAddressFamilies )
+{
+	#if STEAMNETWORKINGSOCKETS_ENABLE_MOCK
+	if ( TEST_mocknetwork_active )
+	{
+		// Find the matching interface config by address
+		const TEST_mocknetwork_interface_t *pIfaceConfig = nullptr;
+		if ( pAddrLocal )
+		{
+			if ( pAddrLocal->IsIPv4() )
+			{
+				uint32 nLookupIP = pAddrLocal->GetIPv4();
+				if ( nLookupIP != 0 )
+				{
+					for ( const TEST_mocknetwork_interface_t &iface : s_mockNetworkConfig.m_vecInterfaces )
+					{
+						if ( iface.m_ip.IsIPv4() && iface.m_ip.GetIPv4() == nLookupIP )
+						{
+							pIfaceConfig = &iface;
+							break;
+						}
+					}
+					if ( !pIfaceConfig )
+					{
+						V_sprintf_safe( errMsg, "Mock: no interface configured for %s", SteamNetworkingIPAddrRender( *pAddrLocal ).c_str() );
+						return nullptr;
+					}
+				}
+			}
+			else
+			{
+				// IPv6: check if not the unspecified address (all zeros)
+				bool bHasAddr = false;
+				for ( int i = 0; i < 16; ++i )
+				{
+					if ( pAddrLocal->m_ipv6[i] != 0 ) { bHasAddr = true; break; }
+				}
+				if ( bHasAddr )
+				{
+					for ( const TEST_mocknetwork_interface_t &iface : s_mockNetworkConfig.m_vecInterfaces )
+					{
+						if ( !iface.m_ip.IsIPv4() && memcmp( iface.m_ip.m_ipv6, pAddrLocal->m_ipv6, 16 ) == 0 )
+						{
+							pIfaceConfig = &iface;
+							break;
+						}
+					}
+					if ( !pIfaceConfig )
+					{
+						V_sprintf_safe( errMsg, "Mock: no interface configured for %s", SteamNetworkingIPAddrRender( *pAddrLocal ).c_str() );
+						return nullptr;
+					}
+				}
+			}
+		}
+		if ( !pIfaceConfig )
+		{
+			Assert( !s_mockNetworkConfig.m_vecInterfaces.empty() );
+			pIfaceConfig = &s_mockNetworkConfig.m_vecInterfaces[0];
+		}
+
+		// Look up gateway config (null for public interfaces)
+		const TEST_mocknetwork_gateway_t *pGatewayConfig = nullptr;
+		if ( pIfaceConfig->m_iGateway >= 0 )
+		{
+			Assert( pIfaceConfig->m_iGateway < (int)s_mockNetworkConfig.m_vecGateways.size() );
+			pGatewayConfig = &s_mockNetworkConfig.m_vecGateways[ pIfaceConfig->m_iGateway ];
+		}
+
+		// Create the appropriate mock socket type
+		CUDPSocketMock *pMock;
+		if ( !pGatewayConfig )
+		{
+			pMock = new CUDPSocketMock_Public( *pIfaceConfig );
+		}
+		else
+		{
+			switch ( pGatewayConfig->m_natType )
+			{
+				default:
+				case TEST_mocknetwork_nat_type::FullCone:
+				case TEST_mocknetwork_nat_type::RestrictedCone:
+				case TEST_mocknetwork_nat_type::PortRestrictedCone:
+					pMock = new CUDPSocketMock_OnePublicPort( *pIfaceConfig, *pGatewayConfig );
+					break;
+				case TEST_mocknetwork_nat_type::Symmetric:
+					pMock = new CUDPSocketMock_Symmetric( *pIfaceConfig, *pGatewayConfig );
+					break;
+			}
+		}
+
+		if ( !pMock->BindLocal( callback, errMsg, pIfaceConfig->m_ip ) )
+		{
+			delete pMock;
+			return nullptr;
+		}
+
+		if ( pAddrLocal )
+			*pAddrLocal = pMock->m_boundAddr;
+		if ( pnAddressFamilies )
+			*pnAddressFamilies = pIfaceConfig->m_ip.IsIPv4() ? k_nAddressFamily_IPv4 : k_nAddressFamily_IPv6;
+
+		return pMock;
+	}
 	#endif
+
+	return OpenRawUDPSocketInternal( callback, errMsg, pAddrLocal, pnAddressFamilies );
 }
 
 /// Draw one specific UDP socket.  Returns false if we detect a
@@ -2516,11 +2457,14 @@ static bool DrainSocket( CRawUDPSocketImpl *pSock )
 						goto tos_done;
 					}
 
-					// The naming of this field is apparently inconsistent
+					// IPv6 tclass
 					if (
 						cmsg->cmsg_level == IPPROTO_IPV6
 						&& (
 							cmsg->cmsg_type == IPV6_TCLASS
+
+							// Older versions of MacOS return the socket
+							// option ID instead of the cmsg ID.
 							|| cmsg->cmsg_type == IPV6_RECVTCLASS
 							#ifdef IP_RECVTCLASS
 								|| cmsg->cmsg_type == IP_RECVTCLASS
@@ -2534,26 +2478,37 @@ static bool DrainSocket( CRawUDPSocketImpl *pSock )
 					}
 
 				#else
+					// IPv4 TOS: returned for AF_INET sockets, and for IPv4-mapped packets on
+					// Linux dual-stack AF_INET6 sockets.
 					if ( cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_TOS )
 					{
 						#ifdef _WIN32
-							AssertMsgOnce( cmsg->cmsg_len == sizeof(cmsghdr) + sizeof(int), "Unexpected IP_TOS cmsg_len %lld", (long long)cmsg->cmsg_len );
-							info.m_tos = (uint8)*((int *) WSA_CMSG_DATA(cmsg));
+							// Windows returns TOS as int
+							AssertMsgOnce( cmsg->cmsg_len >= CMSG_LEN( sizeof(int) ), "Unexpected IP_TOS cmsg_len %lld", (long long)cmsg->cmsg_len );
+							info.m_tos = (uint8)*((int *) CMSG_DATA(cmsg));
 						#else
-							AssertMsgOnce( cmsg->cmsg_len == sizeof(cmsghdr) + sizeof(uint8), "Unexpected IP_TOS cmsg_len %lld", (long long)cmsg->cmsg_len );
+							// POSIX returns TOS as uint8
+							AssertMsgOnce( cmsg->cmsg_len >= CMSG_LEN( sizeof(uint8) ), "Unexpected IP_TOS cmsg_len %lld", (long long)cmsg->cmsg_len );
 							info.m_tos = *((uint8 *) CMSG_DATA(cmsg));
 						#endif
+						goto tos_done;
+					}
+
+					// IPv6 traffic class: returned for pure IPv6 packets on Linux AF_INET6
+					// sockets, and for all packets (incl. IPv4-mapped) on Windows/Apple AF_INET6.
+					if ( cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_TCLASS )
+					{
+						AssertMsgOnce( cmsg->cmsg_len >= CMSG_LEN( sizeof(int) ), "Unexpected IPV6_TCLASS cmsg_len %lld", (long long)cmsg->cmsg_len );
+						info.m_tos = (uint8)*((int *) CMSG_DATA(cmsg));
 						goto tos_done;
 					}
 				#endif
 			}
 
 			// If we get here, we scanned all control messages but didn't get the TOS data.
-			// If the platform supports it, we always ask for TOS, so it's bad that we didn't get it back.
-			// But only assert once, because all of the current the code that consumes this field
-			// is tolerant of the fact that it might not be available.  (Since we have to
-			// support platforms that don't support it at all.)
-			AssertMsgOnce( false, "No control data returned even though we asked for TOS?" );
+			// Only assert if we successfully enabled TOS on this socket -- if the setsockopt
+			// failed we already warned at startup and shouldn't fire repeatedly here.
+			AssertMsgOnce( !pSock->m_bWarnIfNoTOSCMsg, "No control data returned even though we asked for TOS?" );
 		}
 		tos_done:
 		#endif
@@ -2715,8 +2670,9 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS, bool bManualPoll )
 	#endif
 
 	// We're back awake.  Grab the lock again
+	#ifdef DBGFLAG_ASSERT
 	SteamNetworkingMicroseconds usecStartedLocking = SteamNetworkingSockets_GetLocalTimestamp();
-	UpdateFakeRateLimitTokenBuckets( usecStartedLocking );
+	#endif
 	for (;;)
 	{
 
@@ -2736,9 +2692,7 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS, bool bManualPoll )
 	#ifdef DBGFLAG_ASSERT
 	{
 		SteamNetworkingMicroseconds usecElapsedWaitingForLock = SteamNetworkingSockets_GetLocalTimestamp() - usecStartedLocking;
-		// Hm, if another thread indicated that they expected to hold the lock for a while,
-		// perhaps we should ignore this assert?
-		AssertMsg1( usecElapsedWaitingForLock < 50*1000 || Plat_IsInDebugSession(),
+		AssertMsg1( usecElapsedWaitingForLock < s_usecServiceThreadLockWaitWarning || Plat_IsInDebugSession(),
 			"SteamnetworkingSockets service thread waited %dms for lock!  This directly adds to network latency!  It could be a bug, but it's usually caused by general performance problem such as thread starvation or a debug output handler taking too long.", int( usecElapsedWaitingForLock/1000 ) );
 	}
 	#endif
@@ -3428,7 +3382,7 @@ static void SteamNetworkingThreadProc()
 
 	#if defined(_WIN32) && !defined(__GNUC__)
 
-		#pragma warning( disable: 6132 ) // Possible infinite loop:  use of the constant EXCEPTION_CONTINUE_EXECUTION in the exception-filter expression of a try-except.  Execution restarts in the protected block.
+		#pragma warning( disable: 6312 ) // Possible infinite loop:  use of the constant EXCEPTION_CONTINUE_EXECUTION in the exception-filter expression of a try-except.  Execution restarts in the protected block.
 
 		typedef struct tagTHREADNAME_INFO
 		{
@@ -3714,145 +3668,6 @@ void CSharedSocket::RemoteHost::Close()
 	}
 }
 
-/////////////////////////////////////////////////////////////////////////////
-//
-// Spew
-//
-/////////////////////////////////////////////////////////////////////////////
-
-static ShortDurationLock s_systemSpewLock( "SystemSpew", LockDebugInfo::k_nOrder_Max ); // Never take another lock while holding this
-SteamNetworkingMicroseconds g_usecLastRateLimitSpew;
-int g_nRateLimitSpewCount;
-ESteamNetworkingSocketsDebugOutputType g_eAppSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_Msg; // Option selected by app
-ESteamNetworkingSocketsDebugOutputType g_eDefaultGroupSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_Msg; // Effective value
-FSteamNetworkingSocketsDebugOutput g_pfnDebugOutput = nullptr;
-void (*g_pfnPreFormatSpewHandler)( ESteamNetworkingSocketsDebugOutputType eType, bool bFmt, const char* pstrFile, int nLine, const char *pMsg, va_list ap ) = SteamNetworkingSockets_DefaultPreFormatDebugOutputHandler;
-static bool s_bSpewInitted = false;
-
-#ifdef STEAMNETWORKINGSOCKETS_ENABLE_SYSTEMSPEW
-static FILE *g_pFileSystemSpew;
-static SteamNetworkingMicroseconds g_usecSystemLogFileOpened;
-static bool s_bNeedToFlushSystemSpew = false;
-static ESteamNetworkingSocketsDebugOutputType g_eSystemSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_None; // Option selected by the "system" (environment variable, etc)
-#else
-constexpr ESteamNetworkingSocketsDebugOutputType g_eSystemSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_None; // Option selected by the "system" (environment variable, etc)
-#endif
-
-static void InitSpew()
-{
-	ShortDurationScopeLock scopeLock( s_systemSpewLock );
-
-	// First time, check environment variables and set system spew level
-	if ( !s_bSpewInitted )
-	{
-		s_bSpewInitted = true;
-
-		#ifdef STEAMNETWORKINGSOCKETS_ENABLE_SYSTEMSPEW
-			const char *STEAMNETWORKINGSOCKETS_LOG_LEVEL = getenv( "STEAMNETWORKINGSOCKETS_LOG_LEVEL" );
-			if ( !V_isempty( STEAMNETWORKINGSOCKETS_LOG_LEVEL ) )
-			{
-				switch ( atoi( STEAMNETWORKINGSOCKETS_LOG_LEVEL ) )
-				{
-					case 0: g_eSystemSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_None; break;
-					case 1: g_eSystemSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_Warning; break;
-					case 2: g_eSystemSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_Msg; break;
-					case 3: g_eSystemSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_Verbose; break;
-					case 4: g_eSystemSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_Debug; break;
-					case 5: g_eSystemSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_Everything; break;
-				}
-
-				if ( g_eSystemSpewLevel > k_ESteamNetworkingSocketsDebugOutputType_None )
-				{
-
-					// What log file to use?
-					const char *pszLogFile = getenv( "STEAMNETWORKINGSOCKETS_LOG_FILE" );
-					if ( !pszLogFile )
-						pszLogFile = "steamnetworkingsockets.log" ;
-
-					// Try to open file.  Use binary mode, since we want to make sure we control
-					// when it is flushed to disk
-					g_pFileSystemSpew = fopen( pszLogFile, "wb" );
-					if ( g_pFileSystemSpew )
-					{
-						g_usecSystemLogFileOpened = SteamNetworkingSockets_GetLocalTimestamp();
-						time_t now = time(nullptr);
-						fprintf( g_pFileSystemSpew, "Log opened, time %lld %s", (long long)now, ctime( &now ) );
-
-						// if they ask for verbose, turn on some other groups, by default
-						if ( g_eSystemSpewLevel >= k_ESteamNetworkingSocketsDebugOutputType_Verbose )
-						{
-							GlobalConfig::LogLevel_P2PRendezvous.m_value.m_defaultValue = g_eSystemSpewLevel;
-							GlobalConfig::LogLevel_P2PRendezvous.m_value.Set( g_eSystemSpewLevel );
-
-							GlobalConfig::LogLevel_PacketGaps.m_value.m_defaultValue = g_eSystemSpewLevel-1;
-							GlobalConfig::LogLevel_PacketGaps.m_value.Set( g_eSystemSpewLevel-1 );
-						}
-					}
-					else
-					{
-						// Failed
-						g_eSystemSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_None;
-					}
-				}
-			}
-		#endif // #ifdef STEAMNETWORKINGSOCKETS_ENABLE_SYSTEMSPEW
-	}
-
-	g_eDefaultGroupSpewLevel = std::max( g_eSystemSpewLevel, g_eAppSpewLevel );
-
-}
-
-static void KillSpew()
-{
-	ShortDurationScopeLock scopeLock( s_systemSpewLock );
-	g_eDefaultGroupSpewLevel = g_eAppSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_None;
-	g_pfnDebugOutput = nullptr;
-	s_bSpewInitted = false;
-
-	#ifdef STEAMNETWORKINGSOCKETS_ENABLE_SYSTEMSPEW
-		g_eSystemSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_None;
-		s_bNeedToFlushSystemSpew = false;
-		if ( g_pFileSystemSpew )
-		{
-			fclose( g_pFileSystemSpew );
-			g_pFileSystemSpew = nullptr;
-		}
-	#endif
-}
-
-#ifdef STEAMNETWORKINGSOCKETS_ENABLE_SYSTEMSPEW
-static void FlushSystemSpewLocked()
-{
-	s_systemSpewLock.AssertHeldByCurrentThread();
-	if ( s_bNeedToFlushSystemSpew )
-	{
-		if ( g_pFileSystemSpew )
-			fflush( g_pFileSystemSpew );
-		s_bNeedToFlushSystemSpew = false;
-	}
-}
-#endif
-
-static void FlushSystemSpew()
-{
-#ifdef STEAMNETWORKINGSOCKETS_ENABLE_SYSTEMSPEW
-	if ( s_bNeedToFlushSystemSpew ) // Read the flag without taking the lock first as an optimization, as most of the time it will not be set
-	{
-		ShortDurationScopeLock scopeLock( s_systemSpewLock );
-		FlushSystemSpewLocked();
-	}
-#endif
-}
-
-
-void ReallySpewTypeFmt( int eType, const char *pMsg, ... )
-{
-	va_list ap;
-	va_start( ap, pMsg );
-	(*g_pfnPreFormatSpewHandler)( ESteamNetworkingSocketsDebugOutputType(eType), true, nullptr, 0, pMsg, ap );
-	va_end( ap );
-}
-
 bool BSteamNetworkingSocketsLowLevelAddRef( SteamNetworkingErrMsg &errMsg )
 {
 	SteamNetworkingGlobalLock::AssertHeldByCurrentThread();
@@ -4121,6 +3936,13 @@ void SteamNetworkingSocketsLowLevelDecRef()
 	// Shutdown Dual wifi support
 	DualWifiShutdown();
 
+	// If we have any tasks that were queued to run in the background,
+	// we'll have to just abandon them.  We don't have enough context
+	// here to run them safely because we hold the lock, and some jobs are
+	// queued to run in the background precisely because there are
+	// potential deadlock issues if they are run while holding the lock.
+	g_taskListRunInBackground.DeleteTasks();
+
 	// Nuke sockets and COM
 	#ifdef _WIN32
 		#if !IsXbox()
@@ -4142,95 +3964,40 @@ void SteamNetworkingSocketsLowLevelValidate( CValidator &validator )
 }
 #endif
 
-void SteamNetworkingSockets_SetDebugOutputFunction( ESteamNetworkingSocketsDebugOutputType eDetailLevel, FSteamNetworkingSocketsDebugOutput pfnFunc )
-{
-	if ( pfnFunc && eDetailLevel > k_ESteamNetworkingSocketsDebugOutputType_None )
-	{
-		SteamNetworkingSocketsLib::g_pfnDebugOutput = pfnFunc;
-		SteamNetworkingSocketsLib::g_eAppSpewLevel = ESteamNetworkingSocketsDebugOutputType( eDetailLevel );
-	}
-	else
-	{
-		SteamNetworkingSocketsLib::g_pfnDebugOutput = nullptr;
-		SteamNetworkingSocketsLib::g_eAppSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_None;
-	}
-
-	SteamNetworkingSocketsLib::InitSpew();
-}
-
-SteamNetworkingMicroseconds SteamNetworkingSockets_GetLocalTimestamp()
-{
-	SteamNetworkingMicroseconds usecResult;
-	long long usecLastReturned;
-	for (;;)
-	{
-		// Fetch values into locals (probably registers)
-		usecLastReturned = SteamNetworkingSocketsLib::s_usecTimeLastReturned;
-		long long usecOffset = SteamNetworkingSocketsLib::s_usecTimeOffset;
-
-		// Read raw timer
-		uint64 usecRaw = Plat_USTime();
-
-		// Add offset to get value in "SteamNetworkingMicroseconds" time
-		usecResult = usecRaw + usecOffset;
-
-		// How much raw timer time (presumed to be wall clock time) has elapsed since
-		// we read the timer?
-		SteamNetworkingMicroseconds usecElapsed = usecResult - usecLastReturned;
-		Assert( usecElapsed >= 0 ); // Our raw timer function is not monotonic!  We assume this never happens!
-		if ( usecElapsed <= k_usecMaxTimestampDelta )
-		{
-			// Should be the common case - only a relatively small of time has elapsed
-			break;
-		}
-		if ( SteamNetworkingSocketsLib::s_nLowLevelSupportRefCount.load(std::memory_order_acquire) <= 0 )
-		{
-			// We don't have any expectation that we should be updating the timer frequently,
-			// so  a big jump in the value just means they aren't calling it very often
-			break;
-		}
-
-		// NOTE: We should only rarely get here, and probably as a result of running under the debugger
-
-		// Adjust offset so that delta between timestamps is limited
-		long long usecNewOffset = usecOffset - ( usecElapsed - k_usecMaxTimestampDelta );
-		usecResult = usecRaw + usecNewOffset;
-
-		// Save the new offset.
-		if ( SteamNetworkingSocketsLib::s_usecTimeOffset.compare_exchange_strong( usecOffset, usecNewOffset ) )
-			break;
-
-		// Race condition which should be extremely rare.  Some other thread changed the offset, in the time
-		// between when we fetched it and now.  (So, a really small race window!)  Just start all over from
-		// the beginning.
-	}
-
-	// Save the last value returned.  Unless another thread snuck in there while we were busy.
-	// If so, that's OK.
-	SteamNetworkingSocketsLib::s_usecTimeLastReturned.compare_exchange_strong( usecLastReturned, usecResult );
-
-	return usecResult;
-}
-
 bool ResolveHostname( const char* pszHostname, CUtlVector< SteamNetworkingIPAddr > *pAddrs )
 {
 #ifdef STEAMNETWORKINGSOCKETS_ENABLE_RESOLVEHOSTNAME
-	char pszHostnameBuffer[256];
+	// If the string parses as a literal IP address (IPv4, IPv6, or [IPv6]:port),
+	// skip DNS entirely.
+	{
+		SteamNetworkingIPAddr addr;
+		if ( addr.ParseString( pszHostname ) )
+		{
+			pAddrs->AddToTail( addr );
+			return true;
+		}
+	}
+
+	char szHostnameBuffer[256];
 	const char* pszPortStr = V_strchr( (char*)pszHostname, ':' );
 	if ( pszPortStr != nullptr )
 	{
 		const int nChars = ( pszPortStr - pszHostname );
-		if( nChars > ( V_ARRAYSIZE( pszHostnameBuffer ) + 1 ))
+		if( nChars >= V_ARRAYSIZE( szHostnameBuffer ) )
 			return false;
-		V_memcpy( pszHostnameBuffer, pszHostname, nChars );
-		pszHostnameBuffer[ nChars ] = '\0';
+		V_memcpy( szHostnameBuffer, pszHostname, nChars );
+		szHostnameBuffer[ nChars ] = '\0';
 		pszPortStr = pszPortStr + 1;
-		pszHostname = pszHostnameBuffer;
+		pszHostname = szHostnameBuffer;
 	}
 
 	addrinfo hints;
 	V_memset( &hints, 0, sizeof( hints ) );
+#ifdef AI_V4MAPPED
 	hints.ai_flags = AI_V4MAPPED | AI_ADDRCONFIG;
+#else
+	hints.ai_flags = AI_ADDRCONFIG;
+#endif
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = 0;
 	hints.ai_protocol = 0;
@@ -4301,12 +4068,84 @@ inline bool GetLocalAddresses_IsReserved( const SteamNetworkingIPAddr &ipAddr )
 	return false;
 }
 
-#if IsWindows()
-
-#pragma comment( lib, "iphlpapi.lib" )
-
-bool GetLocalAddresses( CUtlVector< SteamNetworkingIPAddr >* pAddrs )
+// Convert an IPv4 netmask (host byte order) to a prefix length.
+// Returns 0 if the mask is zero, non-contiguous, or otherwise bogus.
+static int IPv4MaskToPrefixLen( uint32 mask )
 {
+	if ( mask == 0 )
+		return 0;
+	// Count leading 1-bits
+	int n = 0;
+	while ( n < 32 && ( mask & ( 0x80000000u >> n ) ) )
+		++n;
+	// Validate: reconstruct expected mask and compare
+	uint32 expected = ( n == 32 ) ? 0xFFFFFFFFu : ~( 0xFFFFFFFFu >> n );
+	return ( mask == expected ) ? n : 0;
+}
+
+// Convert a 16-byte IPv6 netmask to a prefix length.
+// Returns 0 if the mask is zero, non-contiguous, or otherwise bogus.
+static int IPv6MaskToPrefixLen( const uint8 *pMask )
+{
+	int n = 0;
+	for ( int i = 0; i < 16; ++i )
+	{
+		uint8 b = pMask[i];
+		if ( b == 0xFF ) { n += 8; continue; }
+		if ( b == 0 )
+		{
+			// All remaining bytes must be 0
+			for ( int j = i + 1; j < 16; ++j )
+				if ( pMask[j] != 0 ) return 0;
+			break;
+		}
+		// Partial byte: count leading 1-bits, then validate the rest is 0
+		int nBits = 0;
+		for ( uint8 m = 0x80; m && ( b & m ); m >>= 1 )
+			++nBits;
+		uint8 expected = (uint8)( 0xFF << ( 8 - nBits ) );
+		if ( b != expected ) return 0; // non-contiguous
+		n += nBits;
+		// All remaining bytes must be 0
+		for ( int j = i + 1; j < 16; ++j )
+			if ( pMask[j] != 0 ) return 0;
+		break;
+	}
+	return n; // 0 means all-zero mask, which is bogus
+}
+
+bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
+{
+
+	#if STEAMNETWORKINGSOCKETS_ENABLE_MOCK
+	if ( TEST_mocknetwork_active )
+	{
+		for ( const TEST_mocknetwork_interface_t &iface : s_mockNetworkConfig.m_vecInterfaces )
+		{
+			if ( iface.m_bEnabled )
+			{
+				LocalAddress_t &entry = *pAddrs->AddToTailGetPtr();
+				entry.m_addr = iface.m_ip;
+				{
+					// Private mock LANs get a prefix length (/24 for IPv4, /112 for IPv6) so
+					// IsRemoteAddressOnLocalSubnet can detect same-LAN peers.
+					// Public mock addresses get 0 (no local subnet).
+					int nClassify = ClassifyIP( iface.m_ip );
+					if ( nClassify & k_nIPClassify_Public )
+						entry.m_nPrefixLen = 0;
+					else if ( nClassify & k_nIPClassify_IPv4 )
+						entry.m_nPrefixLen = 24;
+					else
+						entry.m_nPrefixLen = 112;
+				}
+			}
+		}
+		return true;
+	}
+	#endif
+
+#if IsWindows()
+	#pragma comment( lib, "iphlpapi.lib" )
 	if ( pAddrs == nullptr )
 		return false;
 
@@ -4373,16 +4212,17 @@ bool GetLocalAddresses( CUtlVector< SteamNetworkingIPAddr >* pAddrs )
 				continue;
 
             // Got a host address, record it!
-            pAddrs->AddToTail( ipAddr );
+			LocalAddress_t &entry = *pAddrs->AddToTailGetPtr();
+			entry.m_addr = ipAddr;
+			entry.m_nPrefixLen = pThisAddr->OnLinkPrefixLength; // UINT8; 0 is bogus for a unicast addr
         }
     }
 
     free( pAddrInfo );
 	return true;
-}
+
 #elif IsPosix() && !IsPlaystation() && !IsAndroid() && !IsNintendoSwitch()
-bool GetLocalAddresses( CUtlVector< SteamNetworkingIPAddr >* pAddrs )
-{
+
 	ifaddrs *pMyAddrInfo = NULL;
 	int r = getifaddrs( &pMyAddrInfo );
 	if ( r != 0 )
@@ -4415,18 +4255,29 @@ bool GetLocalAddresses( CUtlVector< SteamNetworkingIPAddr >* pAddrs )
 			continue;
 
 		// Got a host address, record it!
-		pAddrs->AddToTail( ipAddr );
+		LocalAddress_t &entry = *pAddrs->AddToTailGetPtr();
+		entry.m_addr = ipAddr;
+		entry.m_nPrefixLen = 0;
+		if ( pAddr->ifa_netmask )
+		{
+			if ( pAddr->ifa_netmask->sa_family == AF_INET )
+			{
+				uint32 mask = BigDWord( ((sockaddr_in *)pAddr->ifa_netmask)->sin_addr.s_addr );
+				entry.m_nPrefixLen = IPv4MaskToPrefixLen( mask );
+			}
+			else if ( pAddr->ifa_netmask->sa_family == AF_INET6 )
+			{
+				entry.m_nPrefixLen = IPv6MaskToPrefixLen( ((sockaddr_in6 *)pAddr->ifa_netmask)->sin6_addr.s6_addr );
+			}
+		}
 	}
 	freeifaddrs( pMyAddrInfo );
 	return true;
-}
 #else
-bool GetLocalAddresses( CUtlVector< SteamNetworkingIPAddr >* pAddrs )
-{
 	AssertMsg( false, "Write me!" );
 	return false;
-}
 #endif
+}
 
 
 } // namespace SteamNetworkingSocketsLib
@@ -4481,148 +4332,6 @@ STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_Poll( int msMaxWait
 		SteamNetworkingGlobalLock::Unlock();
 }
 
-STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_SetLockWaitWarningThreshold( SteamNetworkingMicroseconds usecTheshold )
-{
-	#if STEAMNETWORKINGSOCKETS_LOCK_DEBUG_LEVEL > 0
-		s_usecLockWaitWarningThreshold = usecTheshold;
-	#else
-		// Should we assert here?
-	#endif
-}
-
-STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_SetLockAcquiredCallback( void (*callback)( const char *tags, SteamNetworkingMicroseconds usecWaited ) )
-{
-	#if STEAMNETWORKINGSOCKETS_LOCK_DEBUG_LEVEL > 0
-		s_fLockAcquiredCallback = callback;
-	#else
-		// Should we assert here?
-	#endif
-}
-
-STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_SetLockHeldCallback( void (*callback)( const char *tags, SteamNetworkingMicroseconds usecWaited ) )
-{
-	#if STEAMNETWORKINGSOCKETS_LOCK_DEBUG_LEVEL > 0
-		s_fLockHeldCallback = callback;
-	#else
-		// Should we assert here?
-	#endif
-}
-
-STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_SetPreFormatDebugOutputHandler(
-	ESteamNetworkingSocketsDebugOutputType eDetailLevel,
-	void (*pfn_Handler)( ESteamNetworkingSocketsDebugOutputType eType, bool bFmt, const char* pstrFile, int nLine, const char *pMsg, va_list ap )
-)
-{
-	g_eDefaultGroupSpewLevel = eDetailLevel;
-	g_pfnPreFormatSpewHandler = pfn_Handler;
-}
-
-STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_DefaultPreFormatDebugOutputHandler( ESteamNetworkingSocketsDebugOutputType eType, bool bFmt, const char* pstrFile, int nLine, const char *pMsg, va_list ap )
-{
-	// Do the formatting
-	char buf[ 2048 ];
-	int szBuf = sizeof(buf);
-	char *msgDest = buf;
-	if ( pstrFile )
-	{
-
-		// Skip to "/src/"
-		for (char const* s = pstrFile; *s; ++s)
-		{
-			if (
-				(s[0] == '/' || s[0] == '\\')
-				&& s[1] == 's'
-				&& s[2] == 'r'
-				&& s[3] == 'c'
-				&& (s[4] == '/' || s[4] == '\\')
-			) {
-				pstrFile = s + 1;
-				break;
-			}
-		}
-
-		int l = V_sprintf_safe( buf, "%s(%d): ", pstrFile, nLine );
-		szBuf -= l;
-		msgDest += l;
-	}
-
-	if ( bFmt )
-		V_vsnprintf( msgDest, szBuf, pMsg, ap );
-	else
-		V_strncpy( msgDest, pMsg, szBuf );
-
-	// Gah, some, but not all, of our code has newlines on the end
-	V_StripTrailingWhitespaceASCII( buf );
-
-	// Emit an ETW event.  Unfortunately, TraceLoggingLevel requires a constant argument
-	if ( IsTraceLoggingProviderEnabled( HTraceLogging_SteamNetworkingSockets ) )
-	{
-		if ( eType <= k_ESteamNetworkingSocketsDebugOutputType_Error )
-		{
-			TraceLoggingWrite(
-				HTraceLogging_SteamNetworkingSockets,
-				"Spew",
-				TraceLoggingLevel( WINEVENT_LEVEL_ERROR ),
-				TraceLoggingString( buf, "Msg" )
-			);
-		}
-		else if ( eType == k_ESteamNetworkingSocketsDebugOutputType_Warning )
-		{
-			TraceLoggingWrite(
-				HTraceLogging_SteamNetworkingSockets,
-				"Spew",
-				TraceLoggingLevel( WINEVENT_LEVEL_WARNING ),
-				TraceLoggingString( buf, "Msg" )
-			);
-		}
-		else if ( eType >= k_ESteamNetworkingSocketsDebugOutputType_Verbose )
-		{
-			TraceLoggingWrite(
-				HTraceLogging_SteamNetworkingSockets,
-				"Spew",
-				TraceLoggingLevel( WINEVENT_LEVEL_VERBOSE ),
-				TraceLoggingString( buf, "Msg" )
-			);
-		}
-		else
-		{
-			TraceLoggingWrite(
-				HTraceLogging_SteamNetworkingSockets,
-				"Spew",
-				TraceLoggingLevel( WINEVENT_LEVEL_INFO ),
-				TraceLoggingString( buf, "Msg" )
-			);
-		}
-	}
-
-	// Spew to log file?
-	#ifdef STEAMNETWORKINGSOCKETS_ENABLE_SYSTEMSPEW
-		if ( eType <= g_eSystemSpewLevel && g_pFileSystemSpew )
-		{
-			ShortDurationScopeLock scopeLock( s_systemSpewLock ); // WARNING - these locks are not re-entrant, so if we assert while holding it, we could deadlock!
-			if ( eType <= g_eSystemSpewLevel && g_pFileSystemSpew )
-			{
-
-				// Write
-				SteamNetworkingMicroseconds usecLogTime = SteamNetworkingSockets_GetLocalTimestamp() - g_usecSystemLogFileOpened;
-				fprintf( g_pFileSystemSpew, "%8.3f %s\n", usecLogTime*1e-6, buf );
-
-				// Queue to flush when we we think we can afford to hit the disk synchronously
-				s_bNeedToFlushSystemSpew = true;
-
-				// Flush certain critical messages things immediately
-				if ( eType <= k_ESteamNetworkingSocketsDebugOutputType_Error )
-					FlushSystemSpewLocked();
-			}
-		}
-	#endif
-
-	// Invoke callback
-	FSteamNetworkingSocketsDebugOutput pfnDebugOutput = g_pfnDebugOutput;
-	if ( pfnDebugOutput )
-		pfnDebugOutput( eType, buf );
-}
-
 STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_SetServiceThreadInitCallback( void (*callback)() )
 {
 	AssertMsg( !IsServiceThreadRunning(), "Too late!" );
@@ -4631,46 +4340,56 @@ STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_SetServiceThreadIni
 
 /////////////////////////////////////////////////////////////////////////////
 //
-// memory override
+// Mock network -- public API
 //
 /////////////////////////////////////////////////////////////////////////////
 
-#include <tier0/memdbgoff.h>
+#if STEAMNETWORKINGSOCKETS_ENABLE_MOCK
 
-#ifdef STEAMNETWORKINGSOCKETS_ENABLE_MEM_OVERRIDE
+bool TEST_mocknetwork_active = false;
 
-static bool s_bHasAllocatedMemory = false;
-
-static void* (*s_pfn_malloc)( size_t s ) = malloc;
-static void (*s_pfn_free)( void *p ) = free;
-static void* (*s_pfn_realloc)( void *p, size_t s ) = realloc;
-
-void *SteamNetworkingSockets_Malloc( size_t s )
+void TEST_mocknetwork_init( const TEST_mocknetwork_config_t &config )
 {
-	s_bHasAllocatedMemory = true;
-	return (*s_pfn_malloc)( s );
+	AssertMsg( !TEST_mocknetwork_active, "TEST_mocknetwork_init called twice" );
+	AssertMsg( !config.m_vecInterfaces.empty(), "Mock network must have at least one interface" );
+	s_mockNetworkConfig = config;
+	TEST_mocknetwork_active = true;
+
+	SpewMsg( "Mock network active.\n" );
+	for ( int i = 0; i < (int)config.m_vecGateways.size(); ++i )
+	{
+		const TEST_mocknetwork_gateway_t &gw = config.m_vecGateways[i];
+		const char *pszNATType = "???";
+		switch ( gw.m_natType )
+		{
+			case TEST_mocknetwork_nat_type::FullCone:           pszNATType = "full-cone"; break;
+			case TEST_mocknetwork_nat_type::RestrictedCone:     pszNATType = "restricted-cone"; break;
+			case TEST_mocknetwork_nat_type::PortRestrictedCone: pszNATType = "port-restricted-cone"; break;
+			case TEST_mocknetwork_nat_type::Symmetric:          pszNATType = "symmetric"; break;
+		}
+		SpewMsg( "  Gateway[%d]: %s  NAT=%s  int=%dms  ext=%dms\n",
+			i, SteamNetworkingIPAddrRender( gw.m_public_ip, false ).c_str(),
+			pszNATType, gw.m_nInternalLatencyMS, gw.m_nExternalLatencyMS );
+	}
+	for ( const TEST_mocknetwork_interface_t &iface : config.m_vecInterfaces )
+	{
+		if ( iface.m_bEnabled )
+		{
+			if ( iface.m_iGateway >= 0 )
+				SpewMsg( "  Adapter: %s  gw[%d]  latency=%dms  loss=%d%%\n",
+					SteamNetworkingIPAddrRender( iface.m_ip, false ).c_str(),
+					iface.m_iGateway, iface.m_nSendLatencyMS, iface.m_nSendLossPct );
+			else
+				SpewMsg( "  Adapter: %s  (public)  latency=%dms  loss=%d%%\n",
+					SteamNetworkingIPAddrRender( iface.m_ip, false ).c_str(),
+					iface.m_nSendLatencyMS, iface.m_nSendLossPct );
+		}
+		else
+		{
+			SpewMsg( "  Adapter: %s  (DISABLED)\n",
+				SteamNetworkingIPAddrRender( iface.m_ip, false ).c_str() );
+		}
+	}
 }
 
-void *SteamNetworkingSockets_Realloc( void *p, size_t s )
-{
-	s_bHasAllocatedMemory = true;
-	return (*s_pfn_realloc)( p, s );
-}
-
-void SteamNetworkingSockets_Free( void *p )
-{
-	(*s_pfn_free)( p );
-}
-
-STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_SetCustomMemoryAllocator(
-	void* (*pfn_malloc)( size_t s ),
-	void (*pfn_free)( void *p ),
-	void* (*pfn_realloc)( void *p, size_t s )
-) {
-	Assert( !s_bHasAllocatedMemory ); // Too late!
-
-	s_pfn_malloc = pfn_malloc;
-	s_pfn_free = pfn_free;
-	s_pfn_realloc = pfn_realloc;
-}
-#endif
+#endif // STEAMNETWORKINGSOCKETS_ENABLE_MOCK

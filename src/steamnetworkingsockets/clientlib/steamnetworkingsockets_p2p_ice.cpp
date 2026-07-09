@@ -6,7 +6,8 @@
 #include "steamnetworkingsockets_p2p_ice.h"
 #include "steamnetworkingsockets_udp.h"
 
-#include "steamnetworkingsockets_stun.h"
+// Our own ice client implementation
+#include "steamnetworkingsockets_ice_client.h"
 
 #ifdef STEAMNETWORKINGSOCKETS_ENABLE_WEBRTC
 	#include "steamnetworkingsockets_p2p_webrtc.h"
@@ -121,7 +122,7 @@ void CSteamNetworkConnectionP2P::CheckInitICE()
 		cfg.m_nCandidateTypes |= k_EICECandidate_Any_HostPublic|k_EICECandidate_Any_Reflexive;
 
 		{
-			CUtlVectorAutoPurge<char *> tempStunServers;
+			CUtlVector<char *> tempStunServers;
 			V_AllocAndSplitString( m_connectionConfig.P2P_STUN_ServerList.Get().c_str(), ",", tempStunServers );
 			for ( const char *pszAddress: tempStunServers )
 			{
@@ -133,8 +134,12 @@ void CSteamNetworkConnectionP2P::CheckInitICE()
 				server.append( pszAddress );
 
 				vecStunServers.push_back( std::move( server ) );
-				vecStunServersPsz.push_back( vecStunServers.rbegin()->c_str() );
 			}
+			for ( char *p: tempStunServers ) delete[] p;
+			// Build the pointer array after vecStunServers is fully populated;
+			// doing it inside the loop would produce dangling pointers on reallocation.
+			for ( const std::string &s: vecStunServers )
+				vecStunServersPsz.push_back( s.c_str() );
 		}
 		if ( vecStunServers.empty() )
 			SpewWarningGroup( LogLevel_P2PRendezvous(), "[%s] Reflexive candidates enabled by P2P_Transport_ICE_Enable, but P2P_STUN_ServerList is empty\n", GetDescription() );
@@ -150,15 +155,15 @@ void CSteamNetworkConnectionP2P::CheckInitICE()
 
 	// Get the TURN server list
 	std_vector<std::string> vecTurnServerAddrs;
-	CUtlVectorAutoPurge<char*> vecTurnUsers;
-	CUtlVectorAutoPurge<char*> vecTurnPasses;
+	std_vector<std::string> vecTurnUsers;
+	std_vector<std::string> vecTurnPasses;
 	std_vector<ICESessionConfig::TurnServer> vecTurnServers;
 	if ( P2P_Transport_ICE_Enable & k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_Relay )
 	{
 		cfg.m_nCandidateTypes |= k_EICECandidate_Any_Relay;
 
 		{
-			CUtlVectorAutoPurge<char*> tempTurnServers;
+			CUtlVector<char*> tempTurnServers;
 			V_AllocAndSplitString( m_connectionConfig.P2P_TURN_ServerList.Get().c_str(), ",", tempTurnServers, true );
 			for (const char* pszAddress : tempTurnServers)
 			{
@@ -171,6 +176,7 @@ void CSteamNetworkConnectionP2P::CheckInitICE()
 
 				vecTurnServerAddrs.push_back(std::move(server));
 			}
+			for ( char *p: tempTurnServers ) delete[] p;
 		}
 
 		if (vecTurnServerAddrs.empty())
@@ -182,19 +188,22 @@ void CSteamNetworkConnectionP2P::CheckInitICE()
 			SpewVerboseGroup(LogLevel_P2PRendezvous(), "[%s] Using TURN server list: %s\n", GetDescription(), m_connectionConfig.P2P_TURN_ServerList.Get().c_str());
 			cfg.m_nTurnServers = len(vecTurnServerAddrs);
 
-			// populate usernames
-			V_AllocAndSplitString( m_connectionConfig.P2P_TURN_UserList.Get().c_str(), ",", vecTurnUsers, true) ;
-
-			// populate passwords
-			V_AllocAndSplitString( m_connectionConfig.P2P_TURN_PassList.Get().c_str(), ",", vecTurnPasses, true );
-
-			// If turn arrays lengths (servers, users and passes) are not match, treat all TURN servers as unauthenticated
-			if ( !vecTurnUsers.IsEmpty() || !vecTurnPasses.IsEmpty() )
+			// populate usernames and passwords
 			{
-				if ( cfg.m_nTurnServers != vecTurnUsers.Count() || cfg.m_nTurnServers != vecTurnPasses.Count() )
+				CUtlVector<char*> tempUsers, tempPasses;
+				V_AllocAndSplitString( m_connectionConfig.P2P_TURN_UserList.Get().c_str(), ",", tempUsers, true );
+				V_AllocAndSplitString( m_connectionConfig.P2P_TURN_PassList.Get().c_str(), ",", tempPasses, true );
+				for ( char *p: tempUsers )  { vecTurnUsers.push_back( p );  delete[] p; }
+				for ( char *p: tempPasses ) { vecTurnPasses.push_back( p ); delete[] p; }
+			}
+
+			// If turn array lengths (servers, users and passes) do not match, treat all TURN servers as unauthenticated
+			if ( !vecTurnUsers.empty() || !vecTurnPasses.empty() )
+			{
+				if ( cfg.m_nTurnServers != (int)vecTurnUsers.size() || cfg.m_nTurnServers != (int)vecTurnPasses.size() )
 				{
-					vecTurnUsers.PurgeAndDeleteElements();
-					vecTurnPasses.PurgeAndDeleteElements();
+					vecTurnUsers.clear();
+					vecTurnPasses.clear();
 					SpewWarningGroup(LogLevel_P2PRendezvous(), "[%s] TURN user/pass list is not same length as address list.  Treating all servers as unauthenticated!\n", GetDescription() );
 				}
 			}
@@ -204,16 +213,8 @@ void CSteamNetworkConnectionP2P::CheckInitICE()
 			{
 				ICESessionConfig::TurnServer* turn = push_back_get_ptr( vecTurnServers );
 				turn->m_pszHost = vecTurnServerAddrs[i].c_str();
-
-				if ( vecTurnUsers.Count() > i)
-					turn->m_pszUsername = vecTurnUsers[i];
-				else
-					turn->m_pszUsername = "";
-
-				if ( vecTurnPasses.Count() > i)
-					turn->m_pszPwd = vecTurnPasses[i];
-				else
-					turn->m_pszPwd = "";
+				turn->m_pszUsername = ( i < (int)vecTurnUsers.size() )  ? vecTurnUsers[i].c_str()  : "";
+				turn->m_pszPwd      = ( i < (int)vecTurnPasses.size() ) ? vecTurnPasses[i].c_str() : "";
 			}
 
 			cfg.m_pTurnServers = vecTurnServers.data();
@@ -609,13 +610,10 @@ void CConnectionTransportP2PICE::TransportPopulateConnectionInfo( SteamNetConnec
 			break;
 
 		case k_ESteamNetTransport_UDPProbablyLocal:
-		{
-			int nPingMin, nPingMax;
-			m_pingEndToEnd.GetPingRangeFromRecentBuckets( nPingMin, nPingMax, SteamNetworkingSockets_GetLocalTimestamp() );
-			if ( nPingMin < k_nMinPingTimeLocalTolerance )
-				info.m_nFlags |= k_nSteamNetworkConnectionInfoFlags_Fast;
+			// Both ICE candidates are host type (no NAT traversal), so this is a direct
+			// LAN-style connection regardless of measured ping.
+			info.m_nFlags |= k_nSteamNetworkConnectionInfoFlags_Fast;
 			break;
-		}
 
 		case k_ESteamNetTransport_TURN:
 			info.m_nFlags |= k_nSteamNetworkConnectionInfoFlags_Relayed;
@@ -628,8 +626,6 @@ void CConnectionTransportP2PICE::GetDetailedConnectionStatus( SteamNetworkingDet
 {
 	CConnectionTransportUDPBase::GetDetailedConnectionStatus( stats, usecNow );
 	stats.m_eTransportKind = m_eCurrentRouteKind;
-	if ( stats.m_eTransportKind == k_ESteamNetTransport_UDPProbablyLocal && !( stats.m_info.m_nFlags & k_nSteamNetworkConnectionInfoFlags_Fast ) )
-		stats.m_eTransportKind = k_ESteamNetTransport_UDP;
 }
 
 // Base-64 encode the least significant 30 bits.
