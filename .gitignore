@@ -78,3 +78,6 @@ build-linux/
 build-win-static/
 build-static/
 vcpkg_installed/
+
+bindings/csharp/*/bin/
+bindings/csharp/*/obj/
