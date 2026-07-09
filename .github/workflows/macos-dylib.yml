@@ -1,0 +1,77 @@
+name: macOS universal dylib
+# Produces the libGameNetworkingSockets.dylib shipped in the C# NuGet package
+# (runtimes/osx-*/native). Builds arm64 + x86_64 on one Apple Silicon runner
+# and fuses them with lipo, so the same file serves both Mac architectures.
+on:
+  workflow_dispatch:
+
+jobs:
+  build-universal-dylib:
+    name: Build universal dylib
+    runs-on: macos-latest
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VCPKG_DOWNLOADS: ${{ github.workspace }}/vcpkg-downloads
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-bincache
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-bincache,readwrite
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Ensure vcpkg cache directories exist
+      run: |
+        mkdir -p "${VCPKG_DOWNLOADS}"
+        mkdir -p "${VCPKG_DEFAULT_BINARY_CACHE}"
+
+    - name: Install Vcpkg
+      run: |
+        git clone https://github.com/microsoft/vcpkg.git "${VCPKG_ROOT}"
+        cd "${VCPKG_ROOT}"
+        git checkout c3867e714dd3a51c272826eea77267876517ed99
+        ./bootstrap-vcpkg.sh
+
+    - name: Restore vcpkg caches
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ env.VCPKG_DOWNLOADS }}
+          ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+        key: vcpkg-dylib-${{ runner.os }}-c3867e714dd3a51c272826eea77267876517ed99-${{ hashFiles('vcpkg.json') }}
+        restore-keys: |
+          vcpkg-dylib-${{ runner.os }}-
+
+    - name: Build arm64
+      run: |
+        cmake -B build-arm64 \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" \
+          -DVCPKG_TARGET_TRIPLET=arm64-osx \
+          -DCMAKE_OSX_ARCHITECTURES=arm64 \
+          -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TOOLS=OFF
+        cmake --build build-arm64 --config Release
+
+    - name: Build x86_64
+      run: |
+        cmake -B build-x64 \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" \
+          -DVCPKG_TARGET_TRIPLET=x64-osx \
+          -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+          -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TOOLS=OFF
+        cmake --build build-x64 --config Release
+
+    - name: Fuse universal binary
+      run: |
+        ARM64_DYLIB=$(find build-arm64 -name 'libGameNetworkingSockets.dylib' -type f | head -n1)
+        X64_DYLIB=$(find build-x64 -name 'libGameNetworkingSockets.dylib' -type f | head -n1)
+        echo "arm64: ${ARM64_DYLIB}"
+        echo "x64:   ${X64_DYLIB}"
+        lipo -create "${ARM64_DYLIB}" "${X64_DYLIB}" -output libGameNetworkingSockets.dylib
+        lipo -info libGameNetworkingSockets.dylib
+        otool -L libGameNetworkingSockets.dylib
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: libGameNetworkingSockets-osx-universal
+        path: libGameNetworkingSockets.dylib
+        if-no-files-found: error
