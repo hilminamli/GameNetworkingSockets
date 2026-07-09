@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
 namespace GameNetworkingSockets
 {
@@ -32,6 +33,39 @@ namespace GameNetworkingSockets
         {
             if (d == null) return;
             lock (_lock) _rooted.Add(d);
+        }
+
+        // SteamNetworkingIdentity layout: m_eType at +0, m_cbSize at +4, union at +8.
+        // k_ESteamNetworkingIdentityType_GenericString = 2; m_szGenericString is char[32].
+        private const int GenericStringType = 2;
+        private const int IdentityUnionOffset = 8;
+        private const int GenericStringMaxBytes = 32;
+
+        /// <summary>
+        /// Reads the remote peer's identity from a <c>SteamNetConnectionInfo_t*</c> — the
+        /// <c>pInfo</c> handed to signaling callbacks (its first field is
+        /// <c>m_identityRemote</c>). Returns the generic string for generic-string identities,
+        /// or GNS's "type:value" rendering for anything else.
+        /// </summary>
+        public static string RemoteIdentityOf(IntPtr pConnectionInfo)
+        {
+            if (pConnectionInfo == IntPtr.Zero) return "";
+
+            int eType = Marshal.ReadInt32(pConnectionInfo, 0);
+            if (eType == GenericStringType)
+                return Native.PtrToStringUtf8(pConnectionInfo + IdentityUnionOffset, GenericStringMaxBytes);
+
+            var identity = Marshal.PtrToStructure<SteamNetworkingIdentity>(pConnectionInfo);
+            return IdentityToString(ref identity);
+        }
+
+        /// <summary>Renders an identity via GNS's canonical "type:value" format (e.g. "str:player-7").</summary>
+        public static string IdentityToString(ref SteamNetworkingIdentity identity)
+        {
+            var buf = new byte[128];
+            Native.SteamAPI_SteamNetworkingIdentity_ToString(ref identity, buf, (UIntPtr)buf.Length);
+            int end = Array.IndexOf(buf, (byte)0);
+            return System.Text.Encoding.UTF8.GetString(buf, 0, end < 0 ? buf.Length : end);
         }
 
         /// <summary>Builds a <see cref="SteamNetworkingIdentity"/> from a generic string (max 31 chars). Not a SteamID — just an opaque peer label.</summary>

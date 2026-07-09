@@ -10,6 +10,16 @@ namespace GameNetworkingSockets.Transport
         private readonly NetworkingClient _client;
         private readonly MessageReceivedCallback _dispatch;
 
+        // P2P (custom signaling) mode — null when dialing by IP.
+        private readonly SignalingPump _pump;
+        private readonly string _peerIdentity;
+        private readonly int _remoteVirtualPort;
+
+        // Clients never receive NEW connect requests over signaling; reply blobs for the
+        // in-progress connection are routed internally by GNS before this would be consulted.
+        private static readonly FnCustomSignalingOnConnectRequest _ignoreConnectRequests =
+            (IntPtr ctx, uint hConn, ref SteamNetworkingIdentity peer, int vport) => IntPtr.Zero;
+
         /// <summary>True when the connection is in Connected state.</summary>
         public bool IsConnected => _client.IsConnected;
 
@@ -30,9 +40,23 @@ namespace GameNetworkingSockets.Transport
         /// </param>
         public ClientTransport(string address, ushort port,
             int messageBufferSize = NetworkingConstants.DefaultClientMessageBufferSize)
+            : this(messageBufferSize)
         {
-            _address  = address;
-            _port     = port;
+            _address = address;
+            _port    = port;
+        }
+
+        private ClientTransport(ISignalingChannel channel, string peerIdentity, int remoteVirtualPort,
+            int messageBufferSize)
+            : this(messageBufferSize)
+        {
+            _peerIdentity      = peerIdentity;
+            _remoteVirtualPort = remoteVirtualPort;
+            _pump              = new SignalingPump(channel, _ignoreConnectRequests);
+        }
+
+        private ClientTransport(int messageBufferSize)
+        {
             _client   = new NetworkingClient(messageBufferSize);
             _dispatch = (_, data) => OnMessage?.Invoke(data);
 
@@ -40,15 +64,50 @@ namespace GameNetworkingSockets.Transport
             _client.OnDisconnected += (reason, debug) => OnDisconnected?.Invoke();
         }
 
-        /// <summary>Initiates a connection to the configured server address.</summary>
-        public bool Connect() => _client.Connect($"{_address}:{_port}");
+        /// <summary>
+        /// Creates a P2P transport that connects by identity through custom signaling instead of
+        /// dialing an address. Rendezvous blobs travel over <paramref name="channel"/>; the actual
+        /// traffic goes direct (ICE) once negotiated. Requires the library to be initialized with
+        /// an explicit local identity and <see cref="NetworkingConfigValue.P2P_Transport_ICE_Enable"/>
+        /// configured (the open-source build defaults to disabled).
+        /// </summary>
+        /// <param name="channel">Signaling side channel (e.g. the lobby connection).</param>
+        /// <param name="peerIdentity">Generic identity string of the host to connect to.</param>
+        /// <param name="remoteVirtualPort">Virtual port the host listens on; must match its localVirtualPort.</param>
+        /// <param name="messageBufferSize">Max messages drained per <see cref="Tick"/>.</param>
+        public static ClientTransport P2P(ISignalingChannel channel, string peerIdentity,
+            int remoteVirtualPort = 0,
+            int messageBufferSize = NetworkingConstants.DefaultClientMessageBufferSize)
+        {
+            if (channel == null) throw new ArgumentNullException(nameof(channel));
+            if (string.IsNullOrEmpty(peerIdentity))
+                throw new ArgumentException("Peer identity must be non-empty.", nameof(peerIdentity));
+            return new ClientTransport(channel, peerIdentity, remoteVirtualPort, messageBufferSize);
+        }
+
+        /// <summary>
+        /// Initiates the connection — dials the configured address, or in P2P mode starts the
+        /// custom-signaling rendezvous toward the configured peer identity.
+        /// </summary>
+        public bool Connect()
+        {
+            if (_pump == null)
+                return _client.Connect($"{_address}:{_port}");
+
+            // GNS takes ownership of the signaling object per connection — fresh one per attempt.
+            IntPtr signaling = _pump.CreateSignalingObject();
+            if (signaling == IntPtr.Zero) return false;
+            var identity = P2PSignaling.MakeGenericIdentity(_peerIdentity);
+            return _client.ConnectP2PCustomSignaling(signaling, ref identity, _remoteVirtualPort);
+        }
 
         /// <summary>Closes the active connection.</summary>
         public void Disconnect() => _client.Disconnect();
 
-        /// <summary>Runs GNS callbacks and fires OnMessage for each received packet.</summary>
+        /// <summary>Runs GNS callbacks and fires OnMessage for each received packet. In P2P mode also feeds queued signaling blobs into GNS first.</summary>
         public void Tick()
         {
+            _pump?.Drain();
             _client.RunCallbacks();
             _ = _client.ReceiveMessages(_dispatch);
         }
