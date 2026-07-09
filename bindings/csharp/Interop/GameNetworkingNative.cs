@@ -42,6 +42,64 @@ namespace GameNetworkingSockets
             int nOptions,
             IntPtr pOptions);
 
+        // ── P2P (ICE / custom signaling) ─────────────────────────────────────────
+        // These require the library to be built with ENABLE_ICE + USE_STEAMWEBRTC.
+        // ConnectP2P / CreateListenSocketP2P use GNS's built-in signaling (SDR on
+        // Steam; not available in the open fork). ConnectP2PCustomSignaling drives
+        // the connection through a caller-supplied signaling channel — this is the
+        // one we bridge to our own Nexus lobby.
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern uint SteamAPI_ISteamNetworkingSockets_CreateListenSocketP2P(
+            IntPtr self,
+            int nLocalVirtualPort,
+            int nOptions,
+            IntPtr pOptions);   // SteamNetworkingConfigValue_t* — pass IntPtr.Zero
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern uint SteamAPI_ISteamNetworkingSockets_ConnectP2P(
+            IntPtr self,
+            ref SteamNetworkingIdentity identityRemote,
+            int nRemoteVirtualPort,
+            int nOptions,
+            IntPtr pOptions);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern uint SteamAPI_ISteamNetworkingSockets_ConnectP2PCustomSignaling(
+            IntPtr self,
+            IntPtr pSignaling,          // ISteamNetworkingConnectionSignaling* (from CreateCustomSignaling)
+            ref SteamNetworkingIdentity peerIdentity,
+            int nRemoteVirtualPort,
+            int nOptions,
+            IntPtr pOptions);
+
+        /// <summary>
+        /// Builds a native ISteamNetworkingConnectionSignaling from plain C callbacks, so the
+        /// signaling bridge (→ Nexus lobby) lives entirely in managed code. Keep the delegates
+        /// alive (store them in a field) for the lifetime of the returned object — the GC must
+        /// not collect them while GNS holds the function pointers.
+        /// </summary>
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr SteamAPI_ISteamNetworkingSockets_CreateCustomSignaling(
+            IntPtr ctx,
+            FnCustomSignalingSendSignal fnSendSignal,
+            FnCustomSignalingRelease fnRelease);   // null allowed if no cleanup needed
+
+        /// <summary>
+        /// Feed a rendezvous blob received over our signaling channel into GNS. For blobs that
+        /// announce a new incoming connection, fnOnConnectRequest is invoked to obtain a signaling
+        /// object for the reply direction.
+        /// </summary>
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        internal static extern bool SteamAPI_ISteamNetworkingSockets_ReceivedP2PCustomSignal2(
+            IntPtr self,
+            IntPtr pMsg,
+            int cbMsg,
+            IntPtr ctx,
+            FnCustomSignalingOnConnectRequest fnOnConnectRequest,
+            FnCustomSignalingSendRejectionSignal fnSendRejectionSignal);   // null allowed
+
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int SteamAPI_ISteamNetworkingSockets_AcceptConnection(
             IntPtr self,

@@ -81,6 +81,44 @@ namespace GameNetworkingSockets
             return Connection != 0;
         }
 
+        /// <summary>
+        /// Initiates a P2P connection to a remote peer identified by <paramref name="identity"/>,
+        /// using GNS's built-in signaling (SDR on Steam). Requires the native library to be built
+        /// with ENABLE_ICE (+ USE_STEAMWEBRTC for real NAT traversal). For connections routed
+        /// through our own lobby, use <see cref="ConnectP2PCustomSignaling"/> instead.
+        /// </summary>
+        /// <param name="identity">Remote peer identity (e.g. a generic-string id set via SetGenericString).</param>
+        /// <param name="remoteVirtualPort">Virtual port to connect to; must match the listener's. Defaults to 0.</param>
+        public bool ConnectP2P(ref SteamNetworkingIdentity identity, int remoteVirtualPort = 0)
+        {
+            Connection = Native.SteamAPI_ISteamNetworkingSockets_ConnectP2P(
+                _iface, ref identity, remoteVirtualPort, 0, IntPtr.Zero);
+
+            return Connection != 0;
+        }
+
+        /// <summary>
+        /// Initiates a P2P connection driven through a caller-supplied native signaling shim
+        /// (<c>ISteamNetworkingConnectionSignaling*</c>). This is the entry point our Nexus lobby
+        /// bridge uses: the shim forwards ICE rendezvous messages over our own signaling channel.
+        /// Requires ENABLE_ICE + USE_STEAMWEBRTC.
+        /// </summary>
+        /// <param name="pSignaling">Native pointer to an ISteamNetworkingConnectionSignaling instance.</param>
+        /// <param name="peerIdentity">
+        /// The peer's identity. This is NOT a SteamID — <see cref="SteamNetworkingIdentity"/> is a
+        /// tagged union; for our platform-independent lobby set it via
+        /// <c>SteamAPI_SteamNetworkingIdentity_SetGenericString</c> to any label we choose
+        /// (e.g. "player-42"). GNS treats it purely as an opaque endpoint label; Steam is never consulted.
+        /// </param>
+        /// <param name="remoteVirtualPort">Virtual port to connect to. Defaults to 0.</param>
+        public bool ConnectP2PCustomSignaling(IntPtr pSignaling, ref SteamNetworkingIdentity peerIdentity, int remoteVirtualPort = 0)
+        {
+            Connection = Native.SteamAPI_ISteamNetworkingSockets_ConnectP2PCustomSignaling(
+                _iface, pSignaling, ref peerIdentity, remoteVirtualPort, 0, IntPtr.Zero);
+
+            return Connection != 0;
+        }
+
         /// <summary>Closes the active connection and resets connection state.</summary>
         public bool Disconnect(int reason = 0, string debug = null)
         {

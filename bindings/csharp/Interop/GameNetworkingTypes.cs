@@ -203,4 +203,34 @@ namespace GameNetworkingSockets
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void FnDebugOutput(int nType, IntPtr pszMsg);
+
+    // ── Custom signaling callbacks (P2P via our own lobby) ──────────────────────
+    // Plain-C shims exported by the flat API so the whole signaling bridge can be
+    // written in managed code — no native vtable shim needed.
+
+    /// <summary>
+    /// GNS asks us to deliver a rendezvous blob to the peer of <paramref name="hConn"/> over our
+    /// signaling channel (the Nexus lobby). <paramref name="pInfo"/> points at SteamNetConnectionInfo_t
+    /// (696 bytes, read via offset helpers if needed). Return false only on certain failure.
+    /// The blob is opaque; only valid for the duration of the call — copy it out.
+    /// </summary>
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    public delegate bool FnCustomSignalingSendSignal(IntPtr ctx, uint hConn, IntPtr pInfo, IntPtr pMsg, int cbMsg);
+
+    /// <summary>Cleanup hook invoked when GNS is done with the signaling object.</summary>
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void FnCustomSignalingRelease(IntPtr ctx);
+
+    /// <summary>
+    /// Invoked from ReceivedP2PCustomSignal2 when the blob announces a NEW incoming connection.
+    /// Return a signaling object (from CreateCustomSignaling) the library will use to reply to
+    /// this peer, or IntPtr.Zero to ignore the request.
+    /// </summary>
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate IntPtr FnCustomSignalingOnConnectRequest(IntPtr ctx, uint hConn, ref SteamNetworkingIdentity identityPeer, int nLocalVirtualPort);
+
+    /// <summary>Optional: deliver an active rejection blob back to the peer. Pass null to skip.</summary>
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void FnCustomSignalingSendRejectionSignal(IntPtr ctx, ref SteamNetworkingIdentity identityPeer, IntPtr pMsg, int cbMsg);
 }

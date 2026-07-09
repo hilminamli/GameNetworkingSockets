@@ -46,6 +46,30 @@ namespace GameNetworkingSockets
             _pollGroup = CreatePollGroup();
         }
 
+        /// <summary>
+        /// Creates a P2P listen socket (accepts ICE / SDR / custom-signaling connections) instead of an
+        /// IP listener. Peers reach this host by identity, not IP. Requires the native library to be built
+        /// with ENABLE_ICE (+ USE_STEAMWEBRTC for real NAT traversal). Use the <see cref="P2P"/> factory to
+        /// disambiguate from the IP constructor.
+        /// </summary>
+        /// <param name="localVirtualPort">Virtual port peers connect to; must match their remoteVirtualPort. Defaults to 0.</param>
+        /// <param name="messageBufferSize">Max messages drained per <see cref="ReceiveMessages"/> call across the poll group.</param>
+        private NetworkingServer(int localVirtualPort, int messageBufferSize)
+            : base(messageBufferSize)
+        {
+            _listenSocket = Native.SteamAPI_ISteamNetworkingSockets_CreateListenSocketP2P(
+                _iface, localVirtualPort, 0, IntPtr.Zero);
+
+            if (_listenSocket == 0)
+                throw new InvalidOperationException($"Failed to create P2P listen socket on virtual port {localVirtualPort}.");
+
+            _pollGroup = CreatePollGroup();
+        }
+
+        /// <summary>Creates a P2P server listening on the given virtual port (identity-based, not IP).</summary>
+        public static NetworkingServer P2P(int localVirtualPort = 0, int messageBufferSize = NetworkingConstants.DefaultServerMessageBufferSize)
+            => new NetworkingServer(localVirtualPort, messageBufferSize);
+
         // ── Dispatcher hooks ─────────────────────────────────────────────────────
 
         internal override bool OwnsConnection(uint hConn)
