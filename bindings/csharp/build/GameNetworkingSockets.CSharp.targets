@@ -1,0 +1,28 @@
+<Project>
+  <!-- Copy the native library for the building host's OS next to the managed assembly.
+       ($(OS) is Unix on both Linux and macOS, so distinguish them by IsOSPlatform.) -->
+  <PropertyGroup Condition="'$(OS)' != 'Windows_NT'">
+    <_GnsIsMacOS>$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::OSX)))</_GnsIsMacOS>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(OS)' == 'Windows_NT'">
+    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>%(Filename)%(Extension)</Link>
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+  <ItemGroup Condition="'$(OS)' != 'Windows_NT' and '$(_GnsIsMacOS)' != 'true'">
+    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\linux-x64\native\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>%(Filename)%(Extension)</Link>
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+  <ItemGroup Condition="'$(_GnsIsMacOS)' == 'true'">
+    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\osx\native\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>%(Filename)%(Extension)</Link>
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+</Project>
