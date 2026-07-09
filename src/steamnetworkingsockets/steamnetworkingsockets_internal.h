@@ -208,6 +208,18 @@ struct iovec
 		#define unlikely(x) __builtin_expect (!!(x), 0)
 	#endif
 #else
+	// Nested check avoids MSVC preprocessor parse error (C1012) when
+	// __has_builtin(...) appears in a single #if expression alongside ||.
+	#ifdef __has_builtin
+		#if __has_builtin(__builtin_expect)
+			#ifndef likely
+				#define likely(x) __builtin_expect (!!(x), 1)
+			#endif
+			#ifndef unlikely
+				#define unlikely(x) __builtin_expect (!!(x), 0)
+			#endif
+		#endif
+	#endif
 	#ifndef likely
 		#define likely(x) (x)
 	#endif
@@ -275,10 +287,6 @@ const int k_cbSteamNetworkingSocketsTypicalMaxPlaintextPayloadSend = k_cbSteamNe
 const int k_cbSteamNetworkingSocketsMaxEncryptedPayloadRecv = k_cbSteamNetworkingSocketsMaxUDPMsgLen;
 const int k_cbSteamNetworkingSocketsMaxPlaintextPayloadRecv = k_cbSteamNetworkingSocketsMaxUDPMsgLen;
 
-/// Max value that RecvMaxMessageSize can be set to.
-const int k_cbMaxMessageSizeRecv_Limit = k_cbMaxSteamNetworkingSocketsMessageSizeSend*2;
-COMPILE_TIME_ASSERT( k_cbMaxMessageSizeRecv_Limit >= k_cbMaxSteamNetworkingSocketsMessageSizeSend*2 );
-
 /// If we have a cert that is going to expire in <N seconds, try to renew it
 const int k_nSecCertExpirySeekRenew = 3600*2;
 
@@ -290,6 +298,11 @@ COMPILE_TIME_ASSERT( k_cbSteamNetworkingSocketsMaxEncryptedPayloadSend + 50 < k_
 
 /// Min size of raw UDP message.
 const int k_nMinSteamDatagramUDPMsgLen = 5;
+
+/// Max message size we will actually send, internally.  This is a bit of a kludge because the ISteamNetworkingMessages
+/// API prepends messages with a small header, and we want users of that API to be able to use the full message size,
+/// without having to know about this internal header.
+const int k_cbMaxSteamNetworkingSocketsMessageSizeSend_Internal = k_cbMaxSteamNetworkingSocketsMessageSizeSend + 16;
 
 /// When sending a stats message, what sort of reply is requested by the calling code?
 enum EStatsReplyRequest
@@ -858,7 +871,7 @@ struct ConnectionConfig
 	ConfigValue<int32> SendBufferSize;
 	ConfigValue<int32> RecvBufferSize;
 	ConfigValue<int32> RecvBufferMessages;
-	ConfigValue<int32> RecvMaxMessageSize;
+	ConfigValue<int32> RecvMaxMessageSize; // NOTE - use GetEffectiveRecvMaxMessageSize()!
 	ConfigValue<int32> RecvMaxSegmentsPerPacket;
 	ConfigValue<int32> SendRateMin;
 	ConfigValue<int32> SendRateMax;

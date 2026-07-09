@@ -92,14 +92,14 @@ public:
 	virtual void SetConnectionName( HSteamNetConnection hPeer, const char *pszName ) override;
 	virtual bool GetConnectionName( HSteamNetConnection hPeer, char *pszName, int nMaxLen ) override;
 	virtual EResult SendMessageToConnection( HSteamNetConnection hConn, const void *pData, uint32 cbData, int nSendFlags, int64 *pOutMessageNumber ) override;
-	virtual void SendMessages( int nMessages, SteamNetworkingMessage_t *const *pMessages, int64 *pOutMessageNumberOrResult ) override;
+	virtual void SendMessages( int nMessages, SteamNetworkingMessage_t **pMessages, int64 *pOutMessageNumberOrResult, bool bDeleteFailedMessages ) override;
 	virtual EResult FlushMessagesOnConnection( HSteamNetConnection hConn ) override;
 	virtual int ReceiveMessagesOnConnection( HSteamNetConnection hConn, SteamNetworkingMessage_t **ppOutMessages, int nMaxMessages ) override;
 	virtual bool GetConnectionInfo( HSteamNetConnection hConn, SteamNetConnectionInfo_t *pInfo ) override;
 	virtual EResult GetConnectionRealTimeStatus( HSteamNetConnection hConn, SteamNetConnectionRealTimeStatus_t *pStatus, int nLanes, SteamNetConnectionRealTimeLaneStatus_t *pLanes ) override;
 	virtual int GetDetailedConnectionStatus( HSteamNetConnection hConn, char *pszBuf, int cbBuf ) override;
 	virtual bool GetListenSocketAddress( HSteamListenSocket hSocket, SteamNetworkingIPAddr *pAddress ) override;
-	virtual bool CreateSocketPair( HSteamNetConnection *pOutConnection1, HSteamNetConnection *pOutConnection2, bool bUseNetworkLoopback, const SteamNetworkingIdentity *pIdentity1, const SteamNetworkingIdentity *pIdentity2 ) override;
+	virtual bool CreateSocketPair( HSteamNetConnection *pOutConnection1, HSteamNetConnection *pOutConnection2, bool bUseNetworkLoopback, const SteamNetworkingIdentity *pPeerIdentity1, const SteamNetworkingIdentity *pPeerIdentity2 ) override;
 	virtual EResult ConfigureConnectionLanes( HSteamNetConnection hConn, int nNumLanes, const int *pLanePriorities, const uint16 *pLaneWeights ) override;
 	virtual bool GetIdentity( SteamNetworkingIdentity *pIdentity ) override;
 
@@ -131,9 +131,12 @@ public:
 #ifdef STEAMNETWORKINGSOCKETS_STEAMCLIENT
 	virtual int ReceiveMessagesOnListenSocketLegacyPollGroup( HSteamListenSocket hSocket, SteamNetworkingMessage_t **ppOutMessages, int nMaxMessages ) override;
 	virtual void TEST_EnableP2PLooopbackOptimization( bool flag ) override { m_TEST_bEnableP2PLoopbackOptimization = flag; }
+	virtual void TEST_UseLocalIdentityInConnectionDescription( bool flag ) override { m_TEST_bUseLocalIdentityInConnectionDescription = flag; }
 	bool m_TEST_bEnableP2PLoopbackOptimization = true;
+	bool m_TEST_bUseLocalIdentityInConnectionDescription = false;
 #else
 	static constexpr bool m_TEST_bEnableP2PLoopbackOptimization = true;
+	static constexpr bool m_TEST_bUseLocalIdentityInConnectionDescription = false;
 #endif
 
 	virtual void RunCallbacks() override;

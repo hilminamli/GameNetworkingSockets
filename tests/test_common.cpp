@@ -5,9 +5,11 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <assert.h>
 #include <chrono>
 #include <thread>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include <steam/steamnetworkingsockets.h>
 #include <steam/isteamnetworkingutils.h>
@@ -18,6 +20,12 @@
 
 static FILE *g_fpLog = nullptr;
 static SteamNetworkingMicroseconds g_logTimeZero;
+ESteamNetworkingSocketsDebugOutputType g_eTestStdoutDetailLevel = k_ESteamNetworkingSocketsDebugOutputType_Msg;
+
+void TEST_SetStdoutDetailLevel( ESteamNetworkingSocketsDebugOutputType eDetailLevel )
+{
+	g_eTestStdoutDetailLevel = eDetailLevel;
+}
 
 static void DebugOutput( ESteamNetworkingSocketsDebugOutputType eType, const char *pszMsg )
 {
@@ -28,7 +36,7 @@ static void DebugOutput( ESteamNetworkingSocketsDebugOutputType eType, const cha
 	SteamNetworkingMicroseconds time = SteamNetworkingUtils()->GetLocalTimestamp() - g_logTimeZero;
 	if ( g_fpLog )
 		fprintf( g_fpLog, "%10.6f %s\n", time*1e-6, pszMsg );
-	if ( eType <= k_ESteamNetworkingSocketsDebugOutputType_Msg )
+	if ( eType <= g_eTestStdoutDetailLevel )
 	{
 		printf( "%10.6f %s\n", time*1e-6, pszMsg );
 		fflush(stdout);
@@ -41,13 +49,21 @@ static void DebugOutput( ESteamNetworkingSocketsDebugOutputType eType, const cha
 			fflush( g_fpLog );
 
 		// !KLUDGE! Our logging (which is done while we hold the lock)
-		// is occasionally triggering this assert.  Just ignroe that one
+		// is occasionally triggering this assert.  Just ignore that one
 		// error for now.
 		// Yes, this is a kludge.
-		if ( strstr( pszMsg, "SteamNetworkingGlobalLock held for" ) )
+		if ( strstr( pszMsg, "lock held for" ) || strstr( pszMsg, "waited" ) && strstr( pszMsg, "for lock" ) )
 			return;
 
-		assert( !"TEST FAILED" );
+		fprintf( stderr, "\n\n"
+			"%s\n"
+			"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+			"!!                     TEST FAILED                          !!\n"
+			"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n",
+			pszMsg
+		);
+		fflush( stderr );
+		_exit(1);
 	}
 }
 
@@ -73,7 +89,7 @@ void TEST_Fatal( const char *fmt, ... )
 	va_end(ap);
 	fputc('\n', stderr);
 	fflush(stderr);
-	exit(1);
+	_exit(1);
 }
 
 void TEST_InitLog( const char *pszFilename )
@@ -83,9 +99,7 @@ void TEST_InitLog( const char *pszFilename )
 
 	g_logTimeZero = SteamNetworkingUtils()->GetLocalTimestamp();
 
-	//SteamNetworkingUtils()->SetDebugOutputFunction( k_ESteamNetworkingSocketsDebugOutputType_Debug, DebugOutput );
-	SteamNetworkingUtils()->SetDebugOutputFunction( k_ESteamNetworkingSocketsDebugOutputType_Verbose, DebugOutput );
-	//SteamNetworkingUtils()->SetDebugOutputFunction( k_ESteamNetworkingSocketsDebugOutputType_Msg, DebugOutput );
+	SteamNetworkingUtils()->SetDebugOutputFunction( k_ESteamNetworkingSocketsDebugOutputType_Debug, DebugOutput );
 
 	SteamNetworkingUtils()->SetGlobalConfigValueInt32( k_ESteamNetworkingConfig_LogLevel_P2PRendezvous, k_ESteamNetworkingSocketsDebugOutputType_Verbose );
 
@@ -96,6 +110,14 @@ void TEST_InitLog( const char *pszFilename )
 void TEST_Init( const SteamNetworkingIdentity *pIdentity )
 {
 	TEST_InitLog( "log.txt" );
+
+	// Test machines are not always realtime systems and may experience thread starvation.
+	// Set very high lock performance warnings so they don't cause test failures.
+	#if __THREAD_SANITIZER__
+		SteamNetworkingSockets_SetLockWaitWarningThreshold( 2000*1000);
+	#else
+		SteamNetworkingSockets_SetLockWaitWarningThreshold( 300*1000 );
+	#endif
 
 	#ifdef STEAMNETWORKINGSOCKETS_OPENSOURCE
 		SteamDatagramErrMsg errMsg;
@@ -146,4 +168,3 @@ void TEST_PumpCallbacks()
 	#endif
 	std::this_thread::sleep_for( std::chrono::milliseconds( 2 ) );
 }
-

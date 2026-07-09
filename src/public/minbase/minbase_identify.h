@@ -110,6 +110,19 @@
 	#error "Running platform detection twice, or defining IsPosix too soon"
 #endif
 
+// Make sure exactly one of NDEBUG or _DEBUG is defined.  NDEBUG is the C/C++ standard,
+// but we have lots of code that is checking _DEBUG, which is a MSVC convention
+#if defined(NDEBUG) && defined(_DEBUG)
+	#error "Cannot define both NDEBUG and _DEBUG."
+#endif
+#if !defined(NDEBUG) && !defined(_DEBUG)
+	#ifdef _MSC_VER
+		#error "On MSVC, exactly one of NDEBUG or _DEBUG must be defined.  Check your project files."
+	#else
+		#define _DEBUG
+	#endif
+#endif
+
 #ifdef _DEBUG
 	#define IsRelease() false
 	#define IsDebug() true
@@ -154,7 +167,7 @@
 	#if TARGET_OS_TV
 		#define IsTVOS() true
 		#define IsPosix() true
-	#elif TARGET_OS_IOS
+	#elif defined(TARGET_OS_IOS) && TARGET_OS_IOS
 		#define IsIOS() true
 		#define IsPosix() true
 	#else
@@ -168,6 +181,9 @@
 	#define IsPosix() true
 #elif defined(__FreeBSD__)
 	#define IsFreeBSD() true
+	#define IsPosix() true
+#elif defined(__OpenBSD__)
+	#define IsOpenBSD() true
 	#define IsPosix() true
 #elif defined( _POSIX_VERSION ) || defined( POSIX ) || defined( VALVE_POSIX )
 	#define IsPosix() true
@@ -234,6 +250,9 @@
 #endif
 #ifndef IsFreeBSD
 	#define IsFreeBSD() false
+#endif
+#ifndef IsOpenBSD
+	#define IsOpenBSD() false
 #endif
 
 // Detect ARM

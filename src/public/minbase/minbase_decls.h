@@ -99,9 +99,6 @@
 	#define SELECTANY static
 #endif
 
-#undef DLL_EXPORT
-#undef DLL_IMPORT
-
 #if defined(_WIN32) && !defined(_XBOX)
 #define PLAT_DECL_EXPORT __declspec( dllexport )
 #define PLAT_DECL_IMPORT __declspec( dllimport )
@@ -113,28 +110,6 @@
 #define PLAT_DECL_IMPORT
 #else
 #error "Unsupported Platform."
-#endif
-
-#if defined(_XBOX)
-#define DLL_EXPORT extern
-#define DLL_IMPORT extern
-
-#define DLL_CLASS_EXPORT
-#define DLL_CLASS_IMPORT
-
-#define DLL_GLOBAL_EXPORT
-#define DLL_GLOBAL_IMPORT
-#else
-// Used for dll exporting and importing
-#define DLL_EXPORT extern "C" PLAT_DECL_EXPORT
-#define DLL_IMPORT extern "C" PLAT_DECL_IMPORT
-
-// Can't use extern "C" when DLL exporting a class
-#define DLL_CLASS_EXPORT PLAT_DECL_EXPORT
-#define DLL_CLASS_IMPORT PLAT_DECL_IMPORT
-
-#define DLL_GLOBAL_EXPORT PLAT_DECL_EXPORT
-#define DLL_GLOBAL_IMPORT extern PLAT_DECL_IMPORT
 #endif
 
 #ifdef FASTCALL
@@ -179,6 +154,25 @@
         #define FORCEINLINE          inline
         #define FORCEINLINE_TEMPLATE inline
     #endif
+#endif
+
+// Suppress ThreadSanitizer instrumentation for a function.
+// Use this for functions that intentionally access shared data without holding a lock,
+// where the access is known to be safe (e.g. a lockless hint-read with a locked slow path).
+// Prefer this over making the variable std::atomic<>, which would suppress TSan on ALL
+// accesses to the variable and could mask unintentional races elsewhere.
+// We also add noinline, to make sure the function is not inlined into a caller that is
+// instrumented by TSan, which would cause the instrumentation to be applied to the function
+// anyway.
+#if !defined( __SANITIZE_THREAD__ ) && defined(__has_feature)
+	#if __has_feature(thread_sanitizer)
+		#define __SANITIZE_THREAD__ 1
+	#endif
+#endif
+#if __SANITIZE_THREAD__
+	#define ATTR_NO_SANITIZE_THREAD __attribute__(( no_sanitize("thread") ))
+#else
+	#define ATTR_NO_SANITIZE_THREAD
 #endif
 
 // We have some template functions declared in header files that

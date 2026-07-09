@@ -288,7 +288,7 @@ bool CSteamNetworkConnectionP2P::BInitConnect(
 			if ( m_identityRemote.GetFakeIPType() != k_ESteamNetworkingFakeIPType_GlobalIPv4 )
 			{
 				V_sprintf_safe( errMsg, "Can only initiate connection to global FakeIP" );
-				AssertMsg( false, errMsg );
+				AssertMsgFormatted( false, errMsg );
 				return false;
 			}
 		}
@@ -2923,7 +2923,7 @@ bool CSteamNetworkingSockets::InternalReceivedP2PSignal( const CMsgSteamNetworki
 		pConn = pConnBase->AsSteamNetworkConnectionP2P();
 		if ( !pConn )
 		{
-			SpewWarning( "[%s] Got P2P signal from %s.  Wrong connection type!\n", msg.from_identity().c_str(), pConn->GetDescription() );
+			SpewWarning( "[%s] Got P2P signal from %s.  Wrong connection type!\n", msg.from_identity().c_str(), pConnBase->GetDescription() );
 			return false;
 		}
 

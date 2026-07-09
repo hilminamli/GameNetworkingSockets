@@ -31,11 +31,7 @@ public:
 
 	/// Adjust schedule time to the earlier of the current schedule time,
 	/// or the given time.
-	inline void EnsureMinThinkTime( SteamNetworkingMicroseconds usecTargetThinkTime )
-	{
-		if ( usecTargetThinkTime < m_usecNextThinkTime )
-			InternalEnsureMinThinkTime( usecTargetThinkTime );
-	}
+	void EnsureMinThinkTime( SteamNetworkingMicroseconds usecTargetThinkTime );
 
 	/// Clear the next think time.  You won't get a callback.
 	void ClearNextThinkTime() { SetNextThinkTime( k_nThinkTime_Never ); }

@@ -97,7 +97,17 @@ class CTrivialSignalingClient : public ITrivialSignalingClient
 			}
 			signal.push_back('\n');
 
+			// Simulate an unreliable signaling channel.  Applied here rather than
+			// in Send() so that only ICE signals are affected, not the connection
+			// management greeting.
+			if ( m_pOwner->m_nLossPct > 0 && ( rand() % 100 ) < m_pOwner->m_nLossPct )
+				return true;
+
 			m_pOwner->Send( signal );
+
+			if ( m_pOwner->m_nDupPct > 0 && ( rand() % 100 ) < m_pOwner->m_nDupPct )
+				m_pOwner->Send( signal );
+
 			return true;
 		}
 
@@ -113,6 +123,8 @@ class CTrivialSignalingClient : public ITrivialSignalingClient
 	ISteamNetworkingSockets *const m_pSteamNetworkingSockets;
 	std::string m_sGreeting;
 	std::deque< std::string > m_queueSend;
+	int m_nLossPct; // percentage of outbound signals to silently drop
+	int m_nDupPct;  // percentage of outbound signals to send twice
 
 	std::recursive_mutex sockMutex;
 	SOCKET m_sock;
@@ -161,8 +173,8 @@ class CTrivialSignalingClient : public ITrivialSignalingClient
 	}
 
 public:
-	CTrivialSignalingClient( const sockaddr *adrServer, size_t adrServerSize, ISteamNetworkingSockets *pSteamNetworkingSockets )
-	: m_adrServerSize( adrServerSize ), m_pSteamNetworkingSockets( pSteamNetworkingSockets )
+	CTrivialSignalingClient( const sockaddr *adrServer, size_t adrServerSize, ISteamNetworkingSockets *pSteamNetworkingSockets, int nLossPct, int nDupPct )
+	: m_adrServerSize( adrServerSize ), m_pSteamNetworkingSockets( pSteamNetworkingSockets ), m_nLossPct( nLossPct ), m_nDupPct( nDupPct )
 	{
 		memcpy( &m_adrServer, adrServer, adrServerSize );
 		m_sock = INVALID_SOCKET;
@@ -180,7 +192,8 @@ public:
 		Connect();
 	}
 
-	// Send the signal.
+	// Send a raw line to the signaling server.  No fault injection here;
+	// fault injection for ICE signals lives in ConnectionSignaling::SendSignal.
 	void Send( const std::string &s )
 	{
 		assert( s.length() > 0 && s[ s.length()-1 ] == '\n' ); // All of our signals are '\n'-terminated
@@ -232,7 +245,11 @@ public:
 				char buf[256];
 				int r = recv( m_sock, buf, sizeof(buf), 0 );
 				if ( r == 0 )
+				{
+					TEST_Printf( "Signaling server closed connection (recv returned 0).  Closing and restarting connection\n" );
+					CloseSocket();
 					break;
+				}
 				if ( r < 0 )
 				{
 					int e = GetSocketError();
@@ -263,7 +280,7 @@ public:
 				{
 					m_queueSend.pop_front();
 				}
-				else if ( r != 0 )
+				else
 				{
 					// Socket hosed, or we sent a partial signal.
 					// We need to restart connection
@@ -385,7 +402,9 @@ next_message:
 ITrivialSignalingClient *CreateTrivialSignalingClient(
 	const char *pszServerAddress, // Address of the server.
 	ISteamNetworkingSockets *pSteamNetworkingSockets, // Where should we send signals when we get them?
-	SteamNetworkingErrMsg &errMsg // Error message is retjrned here if we fail
+	SteamNetworkingErrMsg &errMsg, // Error message is returned here if we fail
+	int nLossPct,
+	int nDupPct
 ) {
 
 	std::string sAddress( pszServerAddress );
@@ -410,13 +429,9 @@ ITrivialSignalingClient *CreateTrivialSignalingClient(
 		return nullptr;
 	}
 
-	auto *pClient = new CTrivialSignalingClient( pAddrInfo->ai_addr, pAddrInfo->ai_addrlen, pSteamNetworkingSockets );
+	CTrivialSignalingClient *pClient = new CTrivialSignalingClient( pAddrInfo->ai_addr, pAddrInfo->ai_addrlen, pSteamNetworkingSockets, nLossPct, nDupPct );
 
 	freeaddrinfo( pAddrInfo );
 
 	return pClient;
 }
-
-	
-
-

@@ -33,8 +33,17 @@ using namespace SteamNetworkingSocketsLib;
 #include <sys/ptrace.h>
 #endif
 
-#if IsOSX()
+#if IsOSX() || IsFreeBSD() || IsOpenBSD()
+#include <sys/types.h>
 #include <sys/sysctl.h>
+#endif
+
+#if IsFreeBSD()
+#include <sys/user.h>
+#endif
+
+#if IsOpenBSD()
+#include <sys/proc.h>
 #endif
 
 #if IsPlaystation() && defined(_DEBUG)
@@ -57,6 +66,30 @@ bool Plat_IsInDebugSession()
 	info.kp_proc.p_flag = 0;
 	sysctl(mib,4,&info,&size,NULL,0);
 	return ((info.kp_proc.p_flag & P_TRACED) == P_TRACED);
+#elif IsFreeBSD()
+	int mib[4];
+	struct kinfo_proc info;
+	size_t size;
+	mib[0] = CTL_KERN;
+	mib[1] = KERN_PROC;
+	mib[2] = KERN_PROC_PID;
+	mib[3] = getpid();
+	size = sizeof(info);
+	if (sysctl(mib, 4, &info, &size, NULL, 0) == -1)
+	    return false;
+	return ((info.ki_flag & P_TRACED) != 0);
+#elif IsOpenBSD()
+	int mib[4];
+	struct kinfo_proc info;
+	size_t size;
+	mib[0] = CTL_KERN;
+	mib[1] = KERN_PROC;
+	mib[2] = KERN_PROC_PID;
+	mib[3] = getpid();
+	size = sizeof(info);
+	if (sysctl(mib, 4, &info, &size, NULL, 0) == -1)
+	    return false;
+	return ((info.p_psflags & PS_TRACED) != 0);
 #elif IsLinux()
 	static FILE *fp;
 	if ( !fp )
