@@ -139,5 +139,11 @@ namespace GameNetworkingSockets.Transport
             if (_server != null) return _server.GetConnectionStatus(hConn, out pingMs, out packetLoss);
             pingMs = 0; packetLoss = 0f; return false;
         }
+
+        internal bool GetConnectionStats(uint hConn, out ConnectionStats stats)
+        {
+            if (_server != null) return _server.GetConnectionStats(hConn, out stats);
+            stats = default; return false;
+        }
     }
 }

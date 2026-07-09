@@ -33,6 +33,9 @@ namespace GameNetworkingSockets.Transport
         public bool GetConnectionStatus(out int pingMs, out float packetLoss)
             => _transport.GetConnectionStatus(_hConn, out pingMs, out packetLoss);
 
+        public bool GetConnectionStats(out ConnectionStats stats)
+            => _transport.GetConnectionStats(_hConn, out stats);
+
         internal void DispatchMessage(ReadOnlySpan<byte> data)
             => OnMessage?.Invoke(data);
 

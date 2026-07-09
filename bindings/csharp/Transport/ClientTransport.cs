@@ -123,6 +123,13 @@ namespace GameNetworkingSockets.Transport
             return _client.GetConnectionStatus(_client.Connection, out pingMs, out packetLoss);
         }
 
+        /// <summary>Returns the full real-time stats block for the active connection. Returns false if not connected.</summary>
+        public bool GetConnectionStats(out ConnectionStats stats)
+        {
+            if (_client.Connection == 0) { stats = default; return false; }
+            return _client.GetConnectionStats(_client.Connection, out stats);
+        }
+
         public void Dispose() => _client.Dispose();
     }
 }

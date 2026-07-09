@@ -33,5 +33,8 @@ namespace GameNetworkingSockets.Transport
 
         /// <summary>Returns real-time connection stats. Returns false if unavailable.</summary>
         bool GetConnectionStatus(out int pingMs, out float packetLoss);
+
+        /// <summary>Returns the full real-time stats block (rates, queues, loss). Returns false if unavailable.</summary>
+        bool GetConnectionStats(out ConnectionStats stats);
     }
 }

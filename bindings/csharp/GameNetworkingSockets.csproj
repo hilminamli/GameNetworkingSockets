@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>netstandard2.1</TargetFramework>
@@ -14,9 +14,9 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
 
     <PackageId>GameNetworkingSockets.CSharp</PackageId>
-    <Version>1.7.0</Version>
+    <Version>1.7.1</Version>
     <Authors>Throwia</Authors>
-    <Description>C# bindings for GameNetworkingSockets — Interop and Transport layers.</Description>
+    <Description>C# bindings for GameNetworkingSockets â€” Interop and Transport layers.</Description>
   </PropertyGroup>
 
   <ItemGroup>
