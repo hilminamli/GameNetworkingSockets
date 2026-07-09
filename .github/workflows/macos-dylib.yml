@@ -1,85 +1,57 @@
 name: macOS universal dylib
-# Produces the ICE-enabled libGameNetworkingSockets.dylib shipped in the C# NuGet
-# package (runtimes/osx-*/native). Mirrors the local recipe in
-# BUILDING_SELF_CONTAINED.md: static vcpkg deps (openssl/protobuf) fused into a
-# shared library, ENABLE_ICE + USE_STEAMWEBRTC (webrtc-lite from submodules).
-# Builds arm64 + x86_64 on one Apple Silicon runner and merges them with lipo.
+# Produces the ICE-enabled (native client, STUN+TURN) libGameNetworkingSockets.dylib
+# shipped in the C# NuGet package (runtimes/osx-*/native). Runs on the self-hosted
+# M2 runner: builds arm64 natively and x86_64 via the cross triplet, fuses with lipo.
+# vcpkg lives at ~/vcpkg-gns on the runner, pinned to the manifest baseline, so
+# dependency builds are cached on disk between runs.
+#
+# One-time runner prerequisites: Xcode command line tools + `brew install cmake ninja`.
+# Manual trigger only — never runs on push/PR (self-hosted safety).
 on:
   workflow_dispatch:
 
 jobs:
   build-universal-dylib:
-    name: Build universal dylib
-    runs-on: macos-latest
-    env:
-      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
-      VCPKG_DOWNLOADS: ${{ github.workspace }}/vcpkg-downloads
-      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-bincache
-      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-bincache,readwrite
+    name: Build universal dylib (self-hosted M2)
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
     - uses: actions/checkout@v4
 
-    - name: Fetch submodules (shallow)
-      # webrtc.googlesource.com is huge; try depth-1 first, fall back to full.
+    - name: Sync vcpkg to manifest baseline
       run: |
-        git submodule init
-        git submodule update --depth 1 --recursive || git submodule update --recursive
-
-    - name: Ensure vcpkg cache directories exist
-      run: |
-        mkdir -p "${VCPKG_DOWNLOADS}"
-        mkdir -p "${VCPKG_DEFAULT_BINARY_CACHE}"
-
-    - name: Install Vcpkg
-      # BUILDING_SELF_CONTAINED.md rule: builtin-baseline must equal the vcpkg
-      # checkout HEAD, so clone master and point the manifest at it.
-      run: |
-        git clone https://github.com/microsoft/vcpkg.git "${VCPKG_ROOT}"
-        cd "${VCPKG_ROOT}"
-        ./bootstrap-vcpkg.sh -disableMetrics
-        HEAD=$(git rev-parse HEAD)
-        echo "vcpkg HEAD: ${HEAD}"
-        cd "${GITHUB_WORKSPACE}"
-        sed -i '' "s/\"builtin-baseline\": \".*\"/\"builtin-baseline\": \"${HEAD}\"/" vcpkg.json
-        grep baseline vcpkg.json
-
-    - name: Restore vcpkg caches
-      uses: actions/cache@v4
-      with:
-        path: |
-          ${{ env.VCPKG_DOWNLOADS }}
-          ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-        key: vcpkg-dylib-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
-        restore-keys: |
-          vcpkg-dylib-${{ runner.os }}-
+        BASELINE=$(sed -n 's/.*"builtin-baseline": "\(.*\)".*/\1/p' vcpkg.json)
+        echo "baseline: ${BASELINE}"
+        if [ ! -d "$HOME/vcpkg-gns" ]; then
+          git clone https://github.com/microsoft/vcpkg.git "$HOME/vcpkg-gns"
+        fi
+        cd "$HOME/vcpkg-gns"
+        git fetch --quiet origin
+        git checkout --quiet "${BASELINE}"
+        [ -x ./vcpkg ] || ./bootstrap-vcpkg.sh -disableMetrics
 
     - name: Build arm64
       run: |
-        cmake -B build-arm64 \
+        cmake -B build-arm64 -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" \
+          -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg-gns/scripts/buildsystems/vcpkg.cmake" \
           -DVCPKG_TARGET_TRIPLET=arm64-osx \
           -DCMAKE_OSX_ARCHITECTURES=arm64 \
-          -DBUILD_SHARED_LIB=ON \
+          -DBUILD_SHARED_LIBS=ON \
           -DENABLE_ICE=ON \
-          -DUSE_STEAMWEBRTC=ON \
-          -DProtobuf_USE_STATIC_LIBS=ON \
           -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TOOLS=OFF
-        cmake --build build-arm64 --config Release
+        cmake --build build-arm64
 
     - name: Build x86_64
       run: |
-        cmake -B build-x64 \
+        cmake -B build-x64 -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" \
+          -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg-gns/scripts/buildsystems/vcpkg.cmake" \
           -DVCPKG_TARGET_TRIPLET=x64-osx \
           -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-          -DBUILD_SHARED_LIB=ON \
+          -DBUILD_SHARED_LIBS=ON \
           -DENABLE_ICE=ON \
-          -DUSE_STEAMWEBRTC=ON \
-          -DProtobuf_USE_STATIC_LIBS=ON \
           -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TOOLS=OFF
-        cmake --build build-x64 --config Release
+        cmake --build build-x64
 
     - name: Fuse universal binary
       run: |
