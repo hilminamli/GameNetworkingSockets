@@ -113,6 +113,22 @@ namespace GameNetworkingSockets
         public EResult AcceptConnection(uint hConn)
             => (EResult)Native.SteamAPI_ISteamNetworkingSockets_AcceptConnection(_iface, hConn);
 
+        /// <summary>
+        /// Adopts an incoming custom-signaling P2P connection (call from an OnConnectRequest
+        /// callback with the hConn it received). Custom-signaling connections are not associated
+        /// with any listen socket, so their status callbacks would never route to this server —
+        /// adoption registers the handle first (so subsequent callbacks route here) and then
+        /// accepts it. The Connected state change attaches it to the poll group as usual.
+        /// </summary>
+        public EResult AdoptP2PConnection(uint hConn)
+        {
+            _ = _clients.Add(hConn);
+            var result = AcceptConnection(hConn);
+            if (result != EResult.OK)
+                _ = _clients.Remove(hConn);
+            return result;
+        }
+
         /// <summary>Receives pending messages from all connected clients via the poll group and dispatches each to the callback.</summary>
         public int ReceiveMessages(MessageReceivedCallback receiver)
             => ReceiveMessagesOnPollGroup(_pollGroup, receiver);

@@ -85,6 +85,29 @@ namespace GameNetworkingSockets
         IP_AllowWithoutAuth      = 23,
         /// <summary>Same as <see cref="IP_AllowWithoutAuth"/> but only for localhost peers.</summary>
         IPLocalHost_AllowWithoutAuth = 52,
+
+        // ── P2P / ICE (requires ENABLE_ICE + USE_STEAMWEBRTC build) ───────────
+        /// <summary>[string, global] Comma-separated STUN server list for ICE candidate gathering, e.g. "stun.l.google.com:19302". Set via <c>NetworkingLibrary.SetGlobalConfigString</c>.</summary>
+        P2P_STUN_ServerList      = 103,
+        /// <summary>[connection int32] Bitmask of allowed ICE candidate classes — see <see cref="IceEnable"/>. Native default is -1 ("user settings"), which resolves to disabled in the open-source build: set explicitly before P2P connects.</summary>
+        P2P_Transport_ICE_Enable = 104,
+    }
+
+    /// <summary>Values for <see cref="NetworkingConfigValue.P2P_Transport_ICE_Enable"/> (bitmask).</summary>
+    public static class IceEnable
+    {
+        /// <summary>Use user/platform settings — resolves to disabled in the open-source build.</summary>
+        public const int Default = -1;
+        /// <summary>No ICE at all; never share IP addresses with the peer.</summary>
+        public const int Disable = 0;
+        /// <summary>Relayed connections via a TURN server.</summary>
+        public const int Relay   = 1;
+        /// <summary>Host candidates on link-local / RFC1918 (private) addresses.</summary>
+        public const int Private = 2;
+        /// <summary>STUN reflexive addresses, or non-private host addresses.</summary>
+        public const int Public  = 4;
+        /// <summary>All candidate classes.</summary>
+        public const int All     = 0x7fffffff;
     }
 
     public enum DebugOutputType : int

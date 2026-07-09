@@ -27,6 +27,37 @@ namespace GameNetworkingSockets
 
             if (!ok) return false;
 
+            FinishInit();
+            return true;
+        }
+
+        /// <summary>
+        /// Initializes the GNS library with an explicit local identity (generic string — NOT a SteamID).
+        /// P2P peers must have distinct identities: this is the label custom-signaling peers use to
+        /// address each other (e.g. a lobby-assigned player id).
+        /// </summary>
+        public static bool Initialize(string genericIdentity, out string error)
+        {
+            var identity = new SteamNetworkingIdentity();
+            Native.SteamAPI_SteamNetworkingIdentity_Clear(ref identity);
+            if (!Native.SteamAPI_SteamNetworkingIdentity_SetGenericString(ref identity, genericIdentity))
+            {
+                error = $"Invalid generic identity string: \"{genericIdentity}\" (max 31 chars).";
+                return false;
+            }
+
+            var errBuf = new byte[1024];
+            bool ok = Native.GameNetworkingSockets_InitWithIdentity(ref identity, errBuf);
+            error = ok ? null : Encoding.UTF8.GetString(errBuf).TrimEnd('\0');
+
+            if (!ok) return false;
+
+            FinishInit();
+            return true;
+        }
+
+        private static void FinishInit()
+        {
             _initialized = true;
             _utils = Native.SteamAPI_SteamNetworkingUtils_v003();
 
@@ -35,8 +66,6 @@ namespace GameNetworkingSockets
             _dispatchDelegate = Dispatch;
             _ = Native.SteamAPI_ISteamNetworkingUtils_SetGlobalCallback_SteamNetConnectionStatusChanged(
                 _utils, _dispatchDelegate);
-
-            return true;
         }
 
         /// <summary>Shuts down the GNS library and clears all registered socket instances.</summary>
@@ -57,7 +86,7 @@ namespace GameNetworkingSockets
         // ── Global config ────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Sets a GNS int32 configuration value at global scope. Call after <see cref="Initialize"/>.
+        /// Sets a GNS int32 configuration value at global scope. Call after <see cref="Initialize(out string)"/>.
         /// Connection-scoped settings (e.g. <see cref="NetworkingConfigValue.SendRateMax"/>) propagate
         /// as defaults to every connection created after the call; existing connections are unaffected.
         /// </summary>
@@ -74,6 +103,19 @@ namespace GameNetworkingSockets
 
             return Native.SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueInt32(
                 _utils, (int)value, int32Value);
+        }
+
+        /// <summary>
+        /// Sets a GNS string configuration value at global scope (e.g.
+        /// <see cref="NetworkingConfigValue.P2P_STUN_ServerList"/>). Call after <see cref="Initialize(out string)"/>.
+        /// </summary>
+        public static bool SetGlobalConfigString(NetworkingConfigValue value, string stringValue)
+        {
+            if (!_initialized)
+                throw new InvalidOperationException("Call NetworkingLibrary.Initialize() first.");
+
+            return Native.SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueString(
+                _utils, (int)value, stringValue);
         }
 
         // ── Debug ────────────────────────────────────────────────────────────────

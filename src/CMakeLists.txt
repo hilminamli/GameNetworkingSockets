@@ -49,6 +49,9 @@ set(GNS_CLIENTLIB_SRCS
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_p2p.cpp"
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_stun.cpp"
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_p2p_ice.cpp"
+	# Entire file is inside #ifdef STEAMNETWORKINGSOCKETS_ENABLE_WEBRTC — compiles
+	# to nothing unless USE_STEAMWEBRTC defines it (see below).
+	"steamnetworkingsockets/clientlib/steamnetworkingsockets_p2p_webrtc.cpp"
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_snp.cpp"
 	"steamnetworkingsockets/clientlib/steamnetworkingsockets_udp.cpp"
 )
@@ -267,8 +270,14 @@ macro(set_clientlib_target_properties GNS_TARGET)
 
 		# Wrapper lib is always linked statically in the opensource code.
 		# We might link dynamically in other environments.
+		# STEAMNETWORKINGSOCKETS_ENABLE_WEBRTC is what the runtime implementation
+		# selection (steamnetworkingsockets_p2p_ice.cpp) checks — without it the
+		# webrtc-lite code is compiled but unreachable and P2P silently falls back
+		# to the native ICE client. Upstream only defines it for Valve-internal
+		# Steam builds; define it here whenever webrtc is requested.
 		target_compile_definitions(${GNS_TARGET} PRIVATE
 			STEAMWEBRTC_USE_STATIC_LIBS
+			STEAMNETWORKINGSOCKETS_ENABLE_WEBRTC
 			)
 		target_link_libraries(${GNS_TARGET} PUBLIC
 			$<BUILD_INTERFACE:steamwebrtc>

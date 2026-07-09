@@ -21,6 +21,7 @@
 
   <ItemGroup>
     <Compile Remove="Tests\**" />
+    <Compile Remove="Tests.P2P\**" />
   </ItemGroup>
 
   <ItemGroup>

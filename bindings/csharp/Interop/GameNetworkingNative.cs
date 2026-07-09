@@ -15,6 +15,14 @@ namespace GameNetworkingSockets
             IntPtr pIdentity,       // const SteamNetworkingIdentity* — pass IntPtr.Zero for anonymous
             byte[] errMsg);         // SteamNetworkingErrMsg = char[1024]
 
+        // Same native entry point, but with an explicit local identity. P2P peers must
+        // have distinct identities — the identity is how custom-signaling peers address
+        // each other (we use generic strings; Steam is never involved).
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "GameNetworkingSockets_Init")]
+        internal static extern bool GameNetworkingSockets_InitWithIdentity(
+            ref SteamNetworkingIdentity pIdentity,
+            byte[] errMsg);
+
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void GameNetworkingSockets_Kill();
 
@@ -228,6 +236,13 @@ namespace GameNetworkingSockets
             IntPtr self,
             int eValue,
             int val);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        internal static extern bool SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueString(
+            IntPtr self,
+            int eValue,
+            [MarshalAs(UnmanagedType.LPStr)] string val);
 
         // ── SteamNetworkingIPAddr flat helpers ────────────────────────────────────
 
