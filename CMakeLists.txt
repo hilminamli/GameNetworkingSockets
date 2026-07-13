@@ -153,7 +153,10 @@ function(set_target_common_gns_properties TGT)
 
 	if(CMAKE_SYSTEM_NAME MATCHES Linux)
 		target_compile_definitions(${TGT} PUBLIC LINUX)
-	elseif(CMAKE_SYSTEM_NAME MATCHES Darwin)
+	elseif(APPLE)
+		# Covers macOS (Darwin) and the other Apple platforms (iOS, tvOS, visionOS):
+		# CMAKE_SYSTEM_NAME is "iOS"/"tvOS"/etc. there, not "Darwin", so match the
+		# APPLE family flag instead of the name. GNS's POSIX/OSX path works on all of them.
 		target_compile_definitions(${TGT} PUBLIC OSX)
 	elseif(CMAKE_SYSTEM_NAME MATCHES FreeBSD)
 		target_compile_definitions(${TGT} PUBLIC FREEBSD)

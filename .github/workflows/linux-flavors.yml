@@ -4,13 +4,7 @@ name: Linux flavors
 
 # Triggered from the main CI build workflow
 on:
-  workflow_run:
-    workflows: ["Ubuntu"]
-    types:
-      - completed
-  #workflow_call:
-  #workflow_dispatch:
-  #repository_dispatch:
+  workflow_dispatch:  # manual only — no auto chain off the Ubuntu build
   #  types: [ build-linux-flavors ]
 
 jobs:
