@@ -17,8 +17,10 @@ namespace GameNetworkingSockets.Transport
 
         // Clients never receive NEW connect requests over signaling; reply blobs for the
         // in-progress connection are routed internally by GNS before this would be consulted.
-        private static readonly FnCustomSignalingOnConnectRequest _ignoreConnectRequests =
-            (IntPtr ctx, uint hConn, ref SteamNetworkingIdentity peer, int vport) => IntPtr.Zero;
+        // This managed handler is invoked from the pump (not marshaled to native), so it may be
+        // a plain method; it just ignores the request.
+        private static IntPtr IgnoreConnectRequests(uint hConn, ref SteamNetworkingIdentity peer, int vport)
+            => IntPtr.Zero;
 
         /// <summary>True when the connection is in Connected state.</summary>
         public bool IsConnected => _client.IsConnected;
@@ -52,7 +54,7 @@ namespace GameNetworkingSockets.Transport
         {
             _peerIdentity      = peerIdentity;
             _remoteVirtualPort = remoteVirtualPort;
-            _pump              = new SignalingPump(channel, _ignoreConnectRequests);
+            _pump              = new SignalingPump(channel, IgnoreConnectRequests);
         }
 
         private ClientTransport(int messageBufferSize)
@@ -130,6 +132,10 @@ namespace GameNetworkingSockets.Transport
             return _client.GetConnectionStats(_client.Connection, out stats);
         }
 
-        public void Dispose() => _client.Dispose();
+        public void Dispose()
+        {
+            _client.Dispose();
+            _pump?.Dispose();   // free the GCHandle rooting this pump for native callbacks
+        }
     }
 }

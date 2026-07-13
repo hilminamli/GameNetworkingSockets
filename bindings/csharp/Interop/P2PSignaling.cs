@@ -85,11 +85,19 @@ namespace GameNetworkingSockets
         /// </summary>
         /// <returns>Native <c>ISteamNetworkingConnectionSignaling*</c>, or <see cref="IntPtr.Zero"/> on failure.</returns>
         public static IntPtr CreateSignalingObject(FnCustomSignalingSendSignal sendSignal, FnCustomSignalingRelease release = null)
+            => CreateSignalingObject(IntPtr.Zero, sendSignal, release);
+
+        /// <summary>
+        /// As <see cref="CreateSignalingObject(FnCustomSignalingSendSignal, FnCustomSignalingRelease)"/>,
+        /// but passes <paramref name="ctx"/> back to the callbacks — required for IL2CPP AOT, where
+        /// the callbacks must be static thunks that recover their instance from this context pointer.
+        /// </summary>
+        public static IntPtr CreateSignalingObject(IntPtr ctx, FnCustomSignalingSendSignal sendSignal, FnCustomSignalingRelease release = null)
         {
             if (sendSignal == null) throw new ArgumentNullException(nameof(sendSignal));
             Root(sendSignal);
             Root(release);
-            return Native.SteamAPI_ISteamNetworkingSockets_CreateCustomSignaling(IntPtr.Zero, sendSignal, release);
+            return Native.SteamAPI_ISteamNetworkingSockets_CreateCustomSignaling(ctx, sendSignal, release);
         }
 
         /// <summary>
@@ -97,7 +105,16 @@ namespace GameNetworkingSockets
         /// For blobs that announce a new incoming connection, <paramref name="onConnectRequest"/>
         /// runs inline and must return a signaling object for the reply direction.
         /// </summary>
-        public static unsafe bool ReceivedSignal(ReadOnlySpan<byte> blob,
+        public static bool ReceivedSignal(ReadOnlySpan<byte> blob,
+            FnCustomSignalingOnConnectRequest onConnectRequest,
+            FnCustomSignalingSendRejectionSignal sendRejection = null)
+            => ReceivedSignal(blob, IntPtr.Zero, onConnectRequest, sendRejection);
+
+        /// <summary>
+        /// As <see cref="ReceivedSignal(ReadOnlySpan{byte}, FnCustomSignalingOnConnectRequest, FnCustomSignalingSendRejectionSignal)"/>,
+        /// but passes <paramref name="ctx"/> back to the callbacks — required for IL2CPP AOT static thunks.
+        /// </summary>
+        public static unsafe bool ReceivedSignal(ReadOnlySpan<byte> blob, IntPtr ctx,
             FnCustomSignalingOnConnectRequest onConnectRequest,
             FnCustomSignalingSendRejectionSignal sendRejection = null)
         {
@@ -112,7 +129,7 @@ namespace GameNetworkingSockets
             fixed (byte* p = blob)
             {
                 return Native.SteamAPI_ISteamNetworkingSockets_ReceivedP2PCustomSignal2(
-                    iface, (IntPtr)p, blob.Length, IntPtr.Zero, onConnectRequest, sendRejection);
+                    iface, (IntPtr)p, blob.Length, ctx, onConnectRequest, sendRejection);
             }
         }
     }

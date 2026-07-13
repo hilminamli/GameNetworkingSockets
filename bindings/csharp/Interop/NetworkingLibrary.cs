@@ -133,8 +133,10 @@ namespace GameNetworkingSockets
             if (log == null) throw new ArgumentNullException(nameof(log));
 
             var oldDelegate = _debugDelegate;
-            var newDelegate = new FnDebugOutput((nType, pszMsg) =>
-                log.Enqueue((DebugOutputType)nType, Native.PtrToStringUtf8(pszMsg, 4096)));
+            // IL2CPP AOT can only marshal a STATIC method to native — no lambdas/closures.
+            // The target log is held in a static field the static thunk reads.
+            _debugLog = log;
+            var newDelegate = new FnDebugOutput(DebugThunk);
 
             // Point native at the new thunk first, then drop the old field reference.
             // GC.KeepAlive keeps the old delegate alive across the native transition so
@@ -143,6 +145,16 @@ namespace GameNetworkingSockets
                 _utils, (int)level, newDelegate);
             _debugDelegate = newDelegate;
             GC.KeepAlive(oldDelegate);
+        }
+
+        private static BufferedDebugLog _debugLog;
+
+        [MonoPInvokeCallback(typeof(FnDebugOutput))]
+        private static void DebugThunk(int nType, IntPtr pszMsg)
+        {
+            var log = _debugLog;
+            if (log == null) return;
+            log.Enqueue((DebugOutputType)nType, Native.PtrToStringUtf8(pszMsg, 4096));
         }
 
         // ── Instance registry ────────────────────────────────────────────────────
@@ -175,6 +187,7 @@ namespace GameNetworkingSockets
 
         // ── Global dispatcher ────────────────────────────────────────────────────
 
+        [MonoPInvokeCallback(typeof(FnConnectionStatusChanged))]
         private static void Dispatch(IntPtr pInfo)
         {
             if (!_initialized) return;

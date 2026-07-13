@@ -15,7 +15,6 @@ namespace GameNetworkingSockets.Transport
         // P2P (custom signaling) mode — _pump is null when listening on a UDP port.
         private readonly SignalingPump _pump;
         private readonly int _localVirtualPort;
-        private readonly FnCustomSignalingOnConnectRequest _onConnectRequest;
 
         /// <summary>Fired when a new client connects.</summary>
         public event Action<IConnection> OnConnected;
@@ -46,8 +45,7 @@ namespace GameNetworkingSockets.Transport
             : this(port: 0, messageBufferSize)
         {
             _localVirtualPort = localVirtualPort;
-            _onConnectRequest = HandleConnectRequest;
-            _pump             = new SignalingPump(channel, _onConnectRequest);
+            _pump             = new SignalingPump(channel, HandleConnectRequest);
         }
 
         /// <summary>
@@ -96,6 +94,7 @@ namespace GameNetworkingSockets.Transport
             _server?.Dispose();
             _server = null;
             _connections.Clear();
+            _pump?.Dispose();   // free the GCHandle rooting this pump for native callbacks
         }
 
         /// <summary>Runs GNS callbacks and dispatches received messages to their connections. In P2P mode also feeds queued signaling blobs into GNS first.</summary>
@@ -114,7 +113,7 @@ namespace GameNetworkingSockets.Transport
         /// the server adopts them explicitly; the returned signaling object carries the reply
         /// blobs for this connection back over the channel.
         /// </summary>
-        private IntPtr HandleConnectRequest(IntPtr ctx, uint hConn, ref SteamNetworkingIdentity identityPeer, int nLocalVirtualPort)
+        private IntPtr HandleConnectRequest(uint hConn, ref SteamNetworkingIdentity identityPeer, int nLocalVirtualPort)
         {
             if (_server == null || _server.AdoptP2PConnection(hConn) != EResult.OK)
                 return IntPtr.Zero;
