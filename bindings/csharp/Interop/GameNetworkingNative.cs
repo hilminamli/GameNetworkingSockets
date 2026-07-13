@@ -8,10 +8,10 @@ namespace GameNetworkingSockets
     {
         // iOS links the transport statically into the player (no dynamic library to
         // load), so P/Invoke must bind against the executable's own symbols via the
-        // special "__Internal" name. This works because the wrapper is compiled from
-        // source by Unity (shipped in the gns-unity package), so UNITY_IOS resolves at
-        // the consumer's build time. Every other platform loads the shared library by
-        // its file name.
+        // special "__Internal" name. A dedicated iOS build of this wrapper DLL is
+        // produced with UNITY_IOS defined (see the iOS-dll build recipe) and shipped
+        // alongside the desktop DLL as an iOS-only plugin; every other platform's DLL
+        // loads the shared library by its file name.
 #if UNITY_IOS && !UNITY_EDITOR
         private const string Lib = "__Internal";
 #else
