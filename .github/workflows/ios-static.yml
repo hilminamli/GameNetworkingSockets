@@ -119,21 +119,30 @@ jobs:
 
     # --- Collect the static lib + all static vcpkg deps into one .a per slice ----
     # GNS links protobuf/openssl(/abseil) statically; on iOS they are NOT bundled
-    # into libGameNetworkingSockets.a automatically, so we merge each slice's own
-    # .a with its vcpkg static deps via libtool into a single self-contained archive.
+    # into the GNS archive automatically, so we merge each slice's own .a with its
+    # vcpkg static deps via libtool into a single self-contained archive.
+    # Note: the static CMake target is GameNetworkingSockets_s → libGameNetworkingSockets_s.a
+    # (trailing _s), NOT libGameNetworkingSockets.a (that's the shared lib's import name).
     - name: Merge static archives per slice
       run: |
+        set -euo pipefail
         merge() {
-          local build="$1" triplet="$2" out="$3"
-          local gns_a
-          gns_a=$(find "$build" -name 'libGameNetworkingSockets.a' -type f | head -n1)
-          local deplib="$HOME/vcpkg-gns/installed/${triplet}/lib"
-          echo "GNS lib: ${gns_a}"
-          echo "dep libs in: ${deplib}"
-          ls -1 "${deplib}"/*.a 2>/dev/null || true
-          libtool -static -o "${out}" "${gns_a}" "${deplib}"/*.a
+          build="$1"; triplet="$2"; out="$3"
+          gns_a=$(find "$build" -name 'libGameNetworkingSockets_s.a' -type f | head -n1)
+          deplib="$HOME/vcpkg-gns/installed/${triplet}/lib"
+          echo "GNS static lib: ${gns_a}"
+          echo "dep libs:"
+          ls -1 "${deplib}"/*.a 2>/dev/null || echo "  (none)"
+          if [ -z "${gns_a}" ] || [ ! -f "${gns_a}" ]; then
+            echo "::error::libGameNetworkingSockets_s.a not found under ${build}"
+            find "$build" -name '*.a' -type f
+            exit 1
+          fi
+          # Unquoted glob so the dep .a's expand; nullglob-safe via the find above.
+          deps=$(ls "${deplib}"/*.a 2>/dev/null || true)
+          libtool -static -o "${out}" "${gns_a}" ${deps}
           echo "merged → ${out}"
-          lipo -info "${out}" || true
+          lipo -info "${out}"
         }
         merge build-ios-device arm64-ios libGNS-device.a
         if [ "${{ steps.triplets.outputs.has_sim }}" = "1" ]; then
