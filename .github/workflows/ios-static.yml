@@ -1,0 +1,159 @@
+name: iOS static lib
+# Produces the STATIC libGameNetworkingSockets for iOS, packaged as an
+# .xcframework (device arm64 + simulator arm64) for the Unity iOS IL2CPP build.
+# iOS forbids loading dynamic native libraries from the app bundle, so unlike the
+# desktop .dylib this must be a static .a linked into the player at build time.
+#
+# PHASE 1: ICE is OFF (IP-only). Goal = clear the "unable to load
+# libGameNetworkingSockets" wall and prove the base transport links on-device.
+# P2P/NAT (ICE) is a separate follow-up — webrtc-lite for arm64-ios is the hard
+# part and is intentionally deferred (mirrors how ICE was tackled separately on
+# Windows).
+#
+# Runs on the same self-hosted M2 runner as macos-dylib.yml. Reuses ~/vcpkg-gns.
+# One-time runner prerequisites: full Xcode (not just CLT — iphoneos SDK needed)
+# + `brew install cmake ninja`. Select an Xcode with `sudo xcode-select -s`.
+# Manual trigger only.
+on:
+  workflow_dispatch:
+    inputs:
+      enable_ice:
+        description: "Enable ICE (P2P/NAT). Phase 2 — expect webrtc-lite arm64-ios build issues."
+        type: boolean
+        default: false
+
+jobs:
+  build-ios-xcframework:
+    name: Build iOS static xcframework (self-hosted M2)
+    runs-on: [self-hosted, macOS, ARM64]
+    env:
+      IOS_DEPLOYMENT_TARGET: "13.0"
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Add Homebrew to PATH
+      run: echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+
+    - name: Show toolchain
+      run: |
+        xcodebuild -version
+        xcrun --sdk iphoneos --show-sdk-path
+        xcrun --sdk iphonesimulator --show-sdk-path
+        cmake --version
+
+    - name: Sync vcpkg to manifest baseline
+      run: |
+        BASELINE=$(sed -n 's/.*"builtin-baseline": "\(.*\)".*/\1/p' vcpkg.json)
+        echo "baseline: ${BASELINE}"
+        if [ ! -d "$HOME/vcpkg-gns" ]; then
+          git clone https://github.com/microsoft/vcpkg.git "$HOME/vcpkg-gns"
+        fi
+        cd "$HOME/vcpkg-gns"
+        git fetch --quiet origin
+        git checkout --quiet "${BASELINE}"
+        [ -x ./vcpkg ] || ./bootstrap-vcpkg.sh -disableMetrics
+
+    - name: Resolve ICE flag
+      id: flags
+      run: |
+        if [ "${{ inputs.enable_ice }}" = "true" ]; then
+          echo "ice=ON" >> "$GITHUB_OUTPUT"
+        else
+          echo "ice=OFF" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Check available iOS triplets
+      id: triplets
+      run: |
+        TRIPLETS_DIR="$HOME/vcpkg-gns/triplets/community"
+        HAS_DEVICE=0; HAS_SIM=0
+        [ -f "$TRIPLETS_DIR/arm64-ios.cmake" ] && HAS_DEVICE=1
+        [ -f "$TRIPLETS_DIR/arm64-ios-simulator.cmake" ] && HAS_SIM=1
+        echo "device triplet (arm64-ios): $HAS_DEVICE"
+        echo "simulator triplet (arm64-ios-simulator): $HAS_SIM"
+        echo "has_sim=$HAS_SIM" >> "$GITHUB_OUTPUT"
+        if [ "$HAS_DEVICE" = "0" ]; then
+          echo "::error::arm64-ios triplet missing at the pinned vcpkg baseline. Bump builtin-baseline in vcpkg.json to a newer commit that ships community iOS triplets."
+          exit 1
+        fi
+        if [ "$HAS_SIM" = "0" ]; then
+          echo "::warning::arm64-ios-simulator triplet missing — building device slice only. The .xcframework will not run on the iOS Simulator (real device only)."
+        fi
+
+    # --- Device slice: arm64-ios -------------------------------------------------
+    - name: Build arm64 device (static)
+      run: |
+        cmake -B build-ios-device -G Ninja \
+          -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg-gns/scripts/buildsystems/vcpkg.cmake" \
+          -DVCPKG_TARGET_TRIPLET=arm64-ios \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_SYSTEM_NAME=iOS \
+          -DCMAKE_OSX_ARCHITECTURES=arm64 \
+          -DCMAKE_OSX_SYSROOT=iphoneos \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
+          -DBUILD_SHARED_LIB=OFF \
+          -DBUILD_STATIC_LIB=ON \
+          -DProtobuf_USE_STATIC_LIBS=ON \
+          -DENABLE_ICE=${{ steps.flags.outputs.ice }} \
+          -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TOOLS=OFF
+        cmake --build build-ios-device
+
+    # --- Simulator slice: arm64 simulator (Apple Silicon Mac) --------------------
+    - name: Build arm64 simulator (static)
+      if: steps.triplets.outputs.has_sim == '1'
+      run: |
+        cmake -B build-ios-sim -G Ninja \
+          -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg-gns/scripts/buildsystems/vcpkg.cmake" \
+          -DVCPKG_TARGET_TRIPLET=arm64-ios-simulator \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_SYSTEM_NAME=iOS \
+          -DCMAKE_OSX_ARCHITECTURES=arm64 \
+          -DCMAKE_OSX_SYSROOT=iphonesimulator \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
+          -DBUILD_SHARED_LIB=OFF \
+          -DBUILD_STATIC_LIB=ON \
+          -DProtobuf_USE_STATIC_LIBS=ON \
+          -DENABLE_ICE=${{ steps.flags.outputs.ice }} \
+          -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TOOLS=OFF
+        cmake --build build-ios-sim
+
+    # --- Collect the static lib + all static vcpkg deps into one .a per slice ----
+    # GNS links protobuf/openssl(/abseil) statically; on iOS they are NOT bundled
+    # into libGameNetworkingSockets.a automatically, so we merge each slice's own
+    # .a with its vcpkg static deps via libtool into a single self-contained archive.
+    - name: Merge static archives per slice
+      run: |
+        merge() {
+          local build="$1" triplet="$2" out="$3"
+          local gns_a
+          gns_a=$(find "$build" -name 'libGameNetworkingSockets.a' -type f | head -n1)
+          local deplib="$HOME/vcpkg-gns/installed/${triplet}/lib"
+          echo "GNS lib: ${gns_a}"
+          echo "dep libs in: ${deplib}"
+          ls -1 "${deplib}"/*.a 2>/dev/null || true
+          libtool -static -o "${out}" "${gns_a}" "${deplib}"/*.a
+          echo "merged → ${out}"
+          lipo -info "${out}" || true
+        }
+        merge build-ios-device arm64-ios libGNS-device.a
+        if [ "${{ steps.triplets.outputs.has_sim }}" = "1" ]; then
+          merge build-ios-sim arm64-ios-simulator libGNS-sim.a
+        fi
+
+    - name: Assemble xcframework
+      run: |
+        rm -rf GameNetworkingSockets.xcframework
+        ARGS="-library libGNS-device.a"
+        if [ "${{ steps.triplets.outputs.has_sim }}" = "1" ]; then
+          ARGS="$ARGS -library libGNS-sim.a"
+        fi
+        xcodebuild -create-xcframework $ARGS -output GameNetworkingSockets.xcframework
+        echo "=== xcframework contents ==="
+        find GameNetworkingSockets.xcframework -maxdepth 2 -type d
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: GameNetworkingSockets-ios-xcframework
+        path: GameNetworkingSockets.xcframework
+        if-no-files-found: error

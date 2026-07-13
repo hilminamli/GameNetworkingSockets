@@ -6,7 +6,15 @@ namespace GameNetworkingSockets
     /// <summary>P/Invoke declarations and raw struct field accessors for the GameNetworkingSockets native library.</summary>
     internal static class Native
     {
+        // iOS links the transport statically into the player (no dynamic library to
+        // load), so P/Invoke must bind against the executable's own symbols via the
+        // special "__Internal" name. Every other platform loads the shared library
+        // by its file name.
+#if UNITY_IOS && !UNITY_EDITOR
+        private const string Lib = "__Internal";
+#else
         private const string Lib = "GameNetworkingSockets";
+#endif
 
         // ── Init / Kill ──────────────────────────────────────────────────────────
 
