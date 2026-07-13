@@ -118,31 +118,69 @@ jobs:
         cmake --build build-ios-sim
 
     # --- Collect the static lib + all static vcpkg deps into one .a per slice ----
-    # GNS links protobuf/openssl(/abseil) statically; on iOS they are NOT bundled
-    # into the GNS archive automatically, so we merge each slice's own .a with its
-    # vcpkg static deps via libtool into a single self-contained archive.
-    # Note: the static CMake target is GameNetworkingSockets_s → libGameNetworkingSockets_s.a
-    # (trailing _s), NOT libGameNetworkingSockets.a (that's the shared lib's import name).
+    # GNS references protobuf/openssl/abseil symbols as UNDEFINED externals; on iOS
+    # they are NOT bundled into the GNS archive automatically, so we fat-merge each
+    # slice's own .a with its vcpkg static deps via libtool into ONE self-contained
+    # archive — consumers then link with zero extra steps.
+    #
+    # Two gotchas fixed here vs. the first attempt:
+    #  1. The static CMake target is GameNetworkingSockets_s → libGameNetworkingSockets_s.a
+    #     (trailing _s), NOT libGameNetworkingSockets.a (that's the shared lib import name).
+    #  2. The deps live under vcpkg's PER-PORT build output
+    #     (packages/<port>_<triplet>/lib), NOT installed/<triplet>/lib — the latter is
+    #     empty in this non-manifest build, which is why OpenSSL never got merged and
+    #     the consumer link failed with undefined _EVP_*/HMAC/X509 symbols.
     - name: Merge static archives per slice
       run: |
         set -euo pipefail
+        VCPKG_PKG="$HOME/vcpkg-gns/packages"
         merge() {
           build="$1"; triplet="$2"; out="$3"
           gns_a=$(find "$build" -name 'libGameNetworkingSockets_s.a' -type f | head -n1)
-          deplib="$HOME/vcpkg-gns/installed/${triplet}/lib"
-          echo "GNS static lib: ${gns_a}"
-          echo "dep libs:"
-          ls -1 "${deplib}"/*.a 2>/dev/null || echo "  (none)"
           if [ -z "${gns_a}" ] || [ ! -f "${gns_a}" ]; then
             echo "::error::libGameNetworkingSockets_s.a not found under ${build}"
             find "$build" -name '*.a' -type f
             exit 1
           fi
-          # Unquoted glob so the dep .a's expand; nullglob-safe via the find above.
-          deps=$(ls "${deplib}"/*.a 2>/dev/null || true)
+          echo "GNS static lib: ${gns_a}"
+
+          # Gather every dep archive for this triplet. Prefer the per-port build outputs
+          # (packages/<port>_<triplet>/lib); fall back to installed/<triplet>/lib if vcpkg
+          # cleaned packages/. openssl (libcrypto+libssl), protobuf, abseil — collect all
+          # *.a so no crypto/proto symbol is left undefined.
+          deps=""
+          for portdir in "$VCPKG_PKG"/*_"${triplet}"; do
+            [ -d "${portdir}/lib" ] || continue
+            for a in "${portdir}/lib"/*.a; do
+              [ -f "$a" ] || continue
+              deps="${deps} ${a}"
+            done
+          done
+          if [ -z "${deps}" ]; then
+            echo "packages/ empty for ${triplet}; falling back to installed/${triplet}/lib"
+            for a in "$HOME/vcpkg-gns/installed/${triplet}/lib"/*.a; do
+              [ -f "$a" ] || continue
+              deps="${deps} ${a}"
+            done
+          fi
+          echo "dep archives to merge:"; for a in ${deps}; do echo "  ${a}"; done
+          if [ -z "${deps}" ]; then
+            echo "::error::No vcpkg dep archives found for ${triplet} (checked packages/ and installed/). openssl/protobuf missing → link will fail."
+            echo "packages/ dir:"; ls -la "$VCPKG_PKG" 2>/dev/null | grep -i "${triplet}\|openssl\|protobuf\|abseil" | head -20
+            exit 1
+          fi
+          # Sanity: openssl MUST be among the deps or the link will fail as reported.
+          if ! echo "${deps}" | grep -q "libcrypto.a"; then
+            echo "::error::libcrypto.a not among deps for ${triplet} — OpenSSL not built for this slice."
+            exit 1
+          fi
+
           libtool -static -o "${out}" "${gns_a}" ${deps}
           echo "merged → ${out}"
           lipo -info "${out}"
+          # Prove the crypto symbol is now DEFINED (T), not undefined (U).
+          echo "verify _EVP_aes_256_gcm:"
+          nm -arch arm64 "${out}" | grep 'EVP_aes_256_gcm' | head -3 || echo "  (symbol not found — investigate)"
         }
         merge build-ios-device arm64-ios libGNS-device.a
         if [ "${{ steps.triplets.outputs.has_sim }}" = "1" ]; then
