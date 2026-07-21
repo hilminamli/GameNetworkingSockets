@@ -385,7 +385,7 @@ Setup:
 2. **Native plugin** — place the platform library (`GameNetworkingSockets.dll`,
    `libGameNetworkingSockets.so`, `libGameNetworkingSockets.dylib`) under
    `Assets/Plugins/<platform>/` with matching platform import settings.
-3. **Editor glue** — install the [`com.throwia.gns-unity`](../unity/README.md) package.
+3. **Editor glue** — install the [`com.gamenetworkingsockets.unity`](../unity/README.md) package.
    It kills the native library before every domain reload; without it, exiting play mode
    with live GNS state corrupts the managed heap and crashes the editor later.
 4. **iOS** — iOS forbids dynamic libraries from P/Invoke; the Unity package ships a

@@ -1,8 +1,8 @@
 {
-  "name": "com.throwia.gns-unity",
+  "name": "com.gamenetworkingsockets.unity",
   "version": "1.0.0",
   "displayName": "GameNetworkingSockets Unity Glue",
   "description": "Unity editor-lifecycle glue for the GameNetworkingSockets C# bindings. Kills the native library before every managed domain reload so GNS worker threads never call into a torn-down domain (the classic play-mode-exit editor crash). Bring GameNetworkingSockets.CSharp.dll and the native library into Assets/Plugins yourself.",
   "unity": "2021.3",
-  "author": { "name": "Throwia" }
+  "author": { "name": "hilminamli" }
 }

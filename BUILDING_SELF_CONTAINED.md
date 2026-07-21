@@ -318,7 +318,7 @@ Toplam paket boyutu ~7 MB civarı olmalı. Eğer 1 MB altındaysa native DLL'ler
 
 ### 3.5 Tüketici tarafında doğrula
 
-Throwia server veya başka bir tüketici projede:
+Herhangi bir tüketici projede:
 
 ```bash
 dotnet add package GameNetworkingSockets.CSharp --version 1.7.0

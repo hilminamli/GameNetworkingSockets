@@ -7,7 +7,7 @@
 // the editor outright — often not at the reload itself but minutes later, in an innocent
 // looking managed stack (Dictionary.TryInsert under RunCallbacks is the classic signature).
 //
-// The fix, proven in the Throwia project: kill the native library BEFORE every domain
+// The fix: kill the native library BEFORE every domain
 // reload. Worker threads stop, every native→managed pointer is unregistered, and the next
 // session re-initializes from scratch (statics reset with the domain, so IsInitialized is
 // false again and consumers just call Initialize as usual).

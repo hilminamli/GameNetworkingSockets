@@ -15,7 +15,7 @@
 
     <PackageId>GameNetworkingSockets.CSharp</PackageId>
     <Version>1.8.0</Version>
-    <Authors>Throwia</Authors>
+    <Authors>hilminamli</Authors>
     <Description>C# bindings for GameNetworkingSockets — Interop and Transport layers. Native libraries built from the fork merged with Valve upstream (native ICE client with STUN+TURN, security fixes). win-x64, linux-x64, and a universal osx (arm64+x86_64) dylib.</Description>
   </PropertyGroup>
 

@@ -11,7 +11,7 @@ crashing the editor later, in an unrelated-looking stack under `RunCallbacks`.
 Add to your project's `Packages/manifest.json`:
 
 ```json
-"com.throwia.gns-unity": "file:<path-to-fork>/bindings/unity"
+"com.gamenetworkingsockets.unity": "file:<path-to-fork>/bindings/unity"
 ```
 
 The managed `GameNetworkingSockets.CSharp.dll` and the native library still go into
