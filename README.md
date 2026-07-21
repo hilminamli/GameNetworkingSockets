@@ -1,6 +1,11 @@
 # GameNetworkingSockets
 [![Ubuntu](https://github.com/ValveSoftware/GameNetworkingSockets/actions/workflows/build-ubuntu.yml/badge.svg)](https://github.com/ValveSoftware/GameNetworkingSockets/actions/workflows/build-ubuntu.yml) [![Windows](https://github.com/ValveSoftware/GameNetworkingSockets/actions/workflows/build-windows.yml/badge.svg)](https://github.com/ValveSoftware/GameNetworkingSockets/actions/workflows/build-windows.yml) [![MacOS](https://github.com/ValveSoftware/GameNetworkingSockets/actions/workflows/macos.yml/badge.svg)](https://github.com/ValveSoftware/GameNetworkingSockets/actions/workflows/macos.yml) [![Soak](https://github.com/ValveSoftware/GameNetworkingSockets/actions/workflows/soak.yml/badge.svg)](https://github.com/ValveSoftware/GameNetworkingSockets/actions/workflows/soak.yml) [![Linux flavors](https://github.com/ValveSoftware/GameNetworkingSockets/actions/workflows/linux-flavors.yml/badge.svg)](https://github.com/ValveSoftware/GameNetworkingSockets/actions/workflows/linux-flavors.yml)
 
+> **This fork** ships first-party **[C# bindings](bindings/csharp/README.md)**
+> (high-level client/server transport + P/Invoke interop, self-contained native
+> libraries for Windows/Linux/macOS/iOS, P2P custom signaling, Unity support)
+> and a **[Unity glue package](bindings/unity/README.md)**.
+
 GameNetworkingSockets is a basic transport layer for games.  The features are:
 
 * Connection-oriented API (like TCP)
@@ -76,6 +81,15 @@ See [BUILDING](BUILDING.md) for more information.
 
 The library was written in C++, but there is also a plain C interface
 to facilitate binding to other languages.
+
+Bindings maintained in this fork:
+
+* **C#** — [bindings/csharp](bindings/csharp/README.md).  Event-driven
+  client/server transport layer plus a thin P/Invoke interop layer,
+  with self-contained native libraries for win-x64, linux-x64, macOS
+  and iOS, P2P/ICE custom-signaling support, and a
+  [Unity glue package](bindings/unity/README.md).  Documented with
+  usage examples.
 
 Third party language bindings:
 
