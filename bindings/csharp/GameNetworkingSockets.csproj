@@ -12,11 +12,20 @@
     <NoWarn>1591</NoWarn>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Release: deterministic build; local source paths in the embedded PDB become /_/,
+         so no machine paths end up in shipped DLLs. -->
+    <ContinuousIntegrationBuild Condition="'$(Configuration)' == 'Release'">true</ContinuousIntegrationBuild>
 
     <PackageId>GameNetworkingSockets.CSharp</PackageId>
     <Version>1.8.0</Version>
     <Authors>hilminamli</Authors>
     <Description>C# bindings for GameNetworkingSockets — Interop and Transport layers. Native libraries built from the fork merged with Valve upstream (native ICE client with STUN+TURN, security fixes). win-x64, linux-x64, and a universal osx (arm64+x86_64) dylib.</Description>
+  </PropertyGroup>
+
+  <!-- iOS variant of the wrapper: P/Invoke binds to "__Internal" (static xcframework).
+       Build with -p:GnsIos=true; see BUILDING_IOS.md. -->
+  <PropertyGroup Condition="'$(GnsIos)' == 'true'">
+    <DefineConstants>$(DefineConstants);UNITY_IOS</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>

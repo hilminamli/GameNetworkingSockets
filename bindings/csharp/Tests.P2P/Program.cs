@@ -16,7 +16,7 @@ namespace GameNetworkingSockets.TestsP2P;
 ///
 /// Two real processes (GNS identity is per-process): "host" runs ServerTransport.P2P, "client"
 /// connects with ClientTransport.P2P. Rendezvous blobs travel over TcpSignalingChannel — a
-/// trivial local TCP implementation of ISignalingChannel, a stand-in for the future Nexus lobby.
+/// trivial local TCP implementation of ISignalingChannel, a stand-in for a real signaling server.
 /// Payload check: client sends "ping", host answers "pong". Default mode spawns both children
 /// and reports a verdict.
 /// </summary>
@@ -212,8 +212,8 @@ internal static class Program
 
 /// <summary>
 /// ISignalingChannel over a raw TCP stream with [4-byte length][blob] framing — the test
-/// stand-in for the future Nexus lobby channel. This test has exactly one peer on the other
-/// end of the pipe, so <c>toIdentity</c> is not used for routing; a real lobby implementation
+/// stand-in for a real signaling server. This test has exactly one peer on the other
+/// end of the pipe, so <c>toIdentity</c> is not used for routing; a real signaling implementation
 /// forwards the blob to the named peer.
 /// </summary>
 internal sealed class TcpSignalingChannel : ISignalingChannel, IDisposable

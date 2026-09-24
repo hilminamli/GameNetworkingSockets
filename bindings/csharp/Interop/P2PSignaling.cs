@@ -6,15 +6,15 @@ namespace GameNetworkingSockets
 {
     /// <summary>
     /// Managed entry points for GNS custom signaling — the mechanism that lets P2P/ICE
-    /// rendezvous blobs travel over OUR signaling channel (the lobby server) instead of Steam.
+    /// rendezvous blobs travel over YOUR signaling channel (e.g. a lobby server) instead of Steam.
     ///
     /// Outbound: <see cref="CreateSignalingObject"/> wraps managed callbacks into a native
     /// <c>ISteamNetworkingConnectionSignaling*</c>. GNS invokes the send callback whenever it
-    /// has a rendezvous blob for the peer — forward that blob over the lobby. Pass the object
+    /// has a rendezvous blob for the peer — forward that blob over the channel. Pass the object
     /// to <see cref="NetworkingClient.ConnectP2PCustomSignaling"/>, or return one from an
     /// OnConnectRequest callback to answer an incoming connection.
     ///
-    /// Inbound: when the lobby delivers a blob from a remote peer, feed it to
+    /// Inbound: when the channel delivers a blob from a remote peer, feed it to
     /// <see cref="ReceivedSignal"/>. If the blob announces a NEW incoming connection, the
     /// onConnectRequest callback is invoked and must return a signaling object for the reply
     /// direction (or <see cref="IntPtr.Zero"/> to ignore the request).
@@ -81,7 +81,7 @@ namespace GameNetworkingSockets
         /// <summary>
         /// Creates a native signaling object from managed callbacks. GNS calls
         /// <paramref name="sendSignal"/> (possibly from its internal service thread) whenever a
-        /// rendezvous blob must reach the peer — copy the blob out and forward it over the lobby.
+        /// rendezvous blob must reach the peer — copy the blob out and forward it over the channel.
         /// </summary>
         /// <returns>Native <c>ISteamNetworkingConnectionSignaling*</c>, or <see cref="IntPtr.Zero"/> on failure.</returns>
         public static IntPtr CreateSignalingObject(FnCustomSignalingSendSignal sendSignal, FnCustomSignalingRelease release = null)
@@ -101,7 +101,7 @@ namespace GameNetworkingSockets
         }
 
         /// <summary>
-        /// Feeds a rendezvous blob received over the lobby into GNS. Call from your receive loop.
+        /// Feeds a rendezvous blob received over the signaling channel into GNS. Call from your receive loop.
         /// For blobs that announce a new incoming connection, <paramref name="onConnectRequest"/>
         /// runs inline and must return a signaling object for the reply direction.
         /// </summary>

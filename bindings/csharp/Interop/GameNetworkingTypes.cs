@@ -227,13 +227,13 @@ namespace GameNetworkingSockets
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void FnDebugOutput(int nType, IntPtr pszMsg);
 
-    // ── Custom signaling callbacks (P2P via our own lobby) ──────────────────────
+    // ── Custom signaling callbacks (P2P via a caller-supplied channel) ──────────
     // Plain-C shims exported by the flat API so the whole signaling bridge can be
     // written in managed code — no native vtable shim needed.
 
     /// <summary>
-    /// GNS asks us to deliver a rendezvous blob to the peer of <paramref name="hConn"/> over our
-    /// signaling channel (the Nexus lobby). <paramref name="pInfo"/> points at SteamNetConnectionInfo_t
+    /// GNS asks the application to deliver a rendezvous blob to the peer of <paramref name="hConn"/>
+    /// over its signaling channel. <paramref name="pInfo"/> points at SteamNetConnectionInfo_t
     /// (696 bytes, read via offset helpers if needed). Return false only on certain failure.
     /// The blob is opaque; only valid for the duration of the call — copy it out.
     /// </summary>

@@ -84,6 +84,7 @@ bindings/csharp/*/obj/
 build-linux/
 build-win-static/
 build-static/
+build-ios-wrapper/
 vcpkg_installed/
 
 #

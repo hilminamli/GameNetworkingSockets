@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build libGameNetworkingSockets.so inside an Amazon Linux 2023 container so it links
-# against AL2023's glibc (2.34) — the exact runtime of the EC2 rendezvous host. A .so
-# built on Ubuntu 24.04 (glibc 2.39) fails there with "GLIBC_2.38 not found".
+# against AL2023's glibc (2.34) and runs on hosts with glibc >= 2.34 (e.g. Amazon Linux
+# 2023). A .so built on Ubuntu 24.04 (glibc 2.39) fails there with "GLIBC_2.38 not found".
 #
 # Run from the fork root on the Docker host:
 #     docker run --rm -v "$PWD":/src -w /work amazonlinux:2023 bash /src/build-linux-al2023.sh
@@ -13,7 +13,7 @@
 # right after the first echo (the "stops after glibc" symptom). Keep -e -u only.
 set -eu
 
-echo "=== glibc of this build environment (must be <= EC2's 2.34) ==="
+echo "=== glibc of this build environment (must be <= 2.34) ==="
 ldd --version | head -1 || true
 
 echo "=== install toolchain (AL2023 packages) ==="
@@ -79,7 +79,7 @@ fi
 echo "=== built: $SO ==="
 ls -la "$SO"
 
-echo "=== max glibc this .so requires (must be <= 2.34 for EC2) ==="
+echo "=== max glibc this .so requires (must be <= 2.34) ==="
 MAXGLIBC=$(objdump -T "$SO" | grep -oE 'GLIBC_[0-9.]+' | sort -V | { tail -1 || true; })
 echo "max GLIBC: ${MAXGLIBC:-none}"
 

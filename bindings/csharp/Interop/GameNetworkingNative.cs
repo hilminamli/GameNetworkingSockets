@@ -9,7 +9,7 @@ namespace GameNetworkingSockets
         // iOS links the transport statically into the player (no dynamic library to
         // load), so P/Invoke must bind against the executable's own symbols via the
         // special "__Internal" name. A dedicated iOS build of this wrapper DLL is
-        // produced with UNITY_IOS defined (see the iOS-dll build recipe) and shipped
+        // produced with UNITY_IOS defined (see BUILDING_IOS.md) and shipped
         // alongside the desktop DLL as an iOS-only plugin; every other platform's DLL
         // loads the shared library by its file name.
 #if UNITY_IOS && !UNITY_EDITOR
@@ -27,7 +27,7 @@ namespace GameNetworkingSockets
 
         // Same native entry point, but with an explicit local identity. P2P peers must
         // have distinct identities — the identity is how custom-signaling peers address
-        // each other (we use generic strings; Steam is never involved).
+        // each other (typically generic strings; Steam is never involved).
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "GameNetworkingSockets_Init")]
         internal static extern bool GameNetworkingSockets_InitWithIdentity(
             ref SteamNetworkingIdentity pIdentity,
@@ -64,8 +64,8 @@ namespace GameNetworkingSockets
         // These require the library to be built with ENABLE_ICE + USE_STEAMWEBRTC.
         // ConnectP2P / CreateListenSocketP2P use GNS's built-in signaling (SDR on
         // Steam; not available in the open fork). ConnectP2PCustomSignaling drives
-        // the connection through a caller-supplied signaling channel — this is the
-        // one we bridge to our own Nexus lobby.
+        // the connection through a caller-supplied signaling channel (e.g. your own
+        // lobby or matchmaking server).
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern uint SteamAPI_ISteamNetworkingSockets_CreateListenSocketP2P(
@@ -93,7 +93,7 @@ namespace GameNetworkingSockets
 
         /// <summary>
         /// Builds a native ISteamNetworkingConnectionSignaling from plain C callbacks, so the
-        /// signaling bridge (→ Nexus lobby) lives entirely in managed code. Keep the delegates
+        /// signaling bridge lives entirely in managed code. Keep the delegates
         /// alive (store them in a field) for the lifetime of the returned object — the GC must
         /// not collect them while GNS holds the function pointers.
         /// </summary>
@@ -104,7 +104,7 @@ namespace GameNetworkingSockets
             FnCustomSignalingRelease fnRelease);   // null allowed if no cleanup needed
 
         /// <summary>
-        /// Feed a rendezvous blob received over our signaling channel into GNS. For blobs that
+        /// Feed a rendezvous blob received over the signaling channel into GNS. For blobs that
         /// announce a new incoming connection, fnOnConnectRequest is invoked to obtain a signaling
         /// object for the reply direction.
         /// </summary>

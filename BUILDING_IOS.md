@@ -34,22 +34,32 @@ If even `arm64-ios` is missing, the run fails with a clear message: bump
 `builtin-baseline` in `vcpkg.json` to a newer commit that ships the community
 iOS triplets, then re-run.
 
-## After the artifact: wiring it into Unity
+## Using it from Unity
 
-Download `GameNetworkingSockets-ios-xcframework` and drop it into the game
-project (planet-game) — this is NOT automatic. Two things beyond the binary:
+The Unity package (`bindings/unity`) already ships both iOS pieces under
+`Runtime/Plugins/iOS/`, each import-restricted to the iOS platform:
 
-1. **The C# P/Invoke must resolve on iOS.** On desktop the wrapper loads the
-   dynamic lib by name; on iOS (IL2CPP, static) P/Invoke uses `__Internal`.
-   The C# wrapper's `DllImport("GameNetworkingSockets")` must become
-   `DllImport("__Internal")` under `UNITY_IOS`, or the entry points won't bind.
-   (This lives in the C# bindings / gns-unity package, handled game-side.)
+1. **`GameNetworkingSockets.xcframework`** — the static library this workflow
+   produces. Unity links it into the generated Xcode project. To update it,
+   download the `GameNetworkingSockets-ios-xcframework` artifact and replace the
+   folder.
 
-2. **Unity plugin import settings + Info.plist.** Set the xcframework's
-   PluginImporter for iOS only; Unity links it into the generated Xcode project.
-   Voice capture additionally needs `NSMicrophoneUsageDescription` in the
-   iOS Info.plist (a Unity `PostProcessBuild` step), or the app crashes the
-   moment it touches the microphone.
+2. **`GameNetworkingSockets.CSharp.dll`** — an iOS-only build of the C# wrapper.
+   On desktop the wrapper loads the dynamic lib by name; on iOS (IL2CPP, static)
+   P/Invoke must bind to `__Internal`, so this variant is compiled with
+   `UNITY_IOS` defined. The desktop wrapper DLL must be excluded on iOS so exactly
+   one wrapper is active per platform (see `bindings/csharp/README.md`).
 
-See planet-game `docs/voice-system.md` and the gns-unity package for the
-game-side wiring.
+## Rebuilding the iOS wrapper DLL
+
+Same sources as the desktop DLL, built with `GnsIos=true` (adds `UNITY_IOS`):
+
+```sh
+dotnet build bindings/csharp/GameNetworkingSockets.csproj -c Release \
+    -p:GnsIos=true -o build-ios-wrapper
+cp build-ios-wrapper/GameNetworkingSockets.CSharp.dll bindings/unity/Runtime/Plugins/iOS/
+```
+
+Release builds are deterministic and map local source paths in the embedded PDB
+to `/_/` (`ContinuousIntegrationBuild` in the csproj), so no machine paths end up
+in the shipped DLL.

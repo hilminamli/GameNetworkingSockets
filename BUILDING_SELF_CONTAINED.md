@@ -102,7 +102,7 @@ wsl -d Ubuntu -- bash -lc 'cd ~/vcpkg && git rev-parse HEAD'
 `/mnt/c/...` üzerinden build çok yavaş (10x), permission sorunları çıkar. Kopyala:
 
 ```bash
-wsl -d Ubuntu -- bash -lc 'mkdir -p ~/build && rm -rf ~/build/gns && cp -r "/mnt/c/Users/NAMLI/OneDrive/Masaüstü/GameNetworkingSockets-fork" ~/build/gns && cd ~/build/gns && rm -rf build-linux build-static vcpkg_installed'
+wsl -d Ubuntu -- bash -lc 'mkdir -p ~/build && rm -rf ~/build/gns && cp -r "/mnt/c/path/to/GameNetworkingSockets-fork" ~/build/gns && cd ~/build/gns && rm -rf build-linux build-static vcpkg_installed'
 ```
 
 ### 1.2 vcpkg.json baseline'ını WSL HEAD ile güncelle
@@ -164,7 +164,7 @@ OpenSSL (`libssl.so`, `libcrypto.so`) veya protobuf (`libprotobuf.so`) görünü
 ### 1.6 binding klasörüne kopyala
 
 ```bash
-wsl -d Ubuntu -- bash -lc 'cp ~/build/gns/build-linux/bin/libGameNetworkingSockets.so "/mnt/c/Users/NAMLI/OneDrive/Masaüstü/GameNetworkingSockets-fork/bindings/csharp/native/linux-x64/"'
+wsl -d Ubuntu -- bash -lc 'cp ~/build/gns/build-linux/bin/libGameNetworkingSockets.so "/mnt/c/path/to/GameNetworkingSockets-fork/bindings/csharp/native/linux-x64/"'
 ```
 
 ---
@@ -186,7 +186,7 @@ Yoksa vcpkg manifest mode CMake configure sırasında otomatik kuracak (uzun sü
 
 ```powershell
 $wHead = (& git -C C:\vcpkg rev-parse HEAD).Trim()
-$repo = "c:\Users\NAMLI\OneDrive\Masaüstü\GameNetworkingSockets-fork"
+$repo = "C:\path\to\GameNetworkingSockets-fork"
 (Get-Content "$repo\vcpkg.json") -replace '"builtin-baseline": ".*"', "`"builtin-baseline`": `"$wHead`"" | Set-Content "$repo\vcpkg.json"
 ```
 
@@ -205,7 +205,7 @@ Eğer sadece `14.38.33130` gibi eski toolset varsa, Visual Studio Installer'dan 
 Visual Studio generator (`-G "Visual Studio 17 2022"`) `-T version=14.44` flag'ini doğru iletmiyor — eski toolset kullanmaya devam ediyor. **Ninja generator** ile `vcvarsall.bat -vcvars_ver=14.44` environment'ı garanti çalışır.
 
 ```powershell
-$repo = "c:\Users\NAMLI\OneDrive\Masaüstü\GameNetworkingSockets-fork"
+$repo = "C:\path\to\GameNetworkingSockets-fork"
 Remove-Item -Recurse -Force "$repo\build-win-static" -ErrorAction SilentlyContinue
 
 $vcvars = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
@@ -232,7 +232,7 @@ Select-String -Path "$repo\build-win-static\CMakeCache.txt" -Pattern "CMAKE_CXX_
 ### 2.5 Ninja ile derle
 
 ```powershell
-$repo = "c:\Users\NAMLI\OneDrive\Masaüstü\GameNetworkingSockets-fork"
+$repo = "C:\path\to\GameNetworkingSockets-fork"
 $vcvars = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
 $cmake = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 
@@ -244,7 +244,7 @@ Sonuç: `build-win-static\bin\GameNetworkingSockets.dll` (~6 MB)
 ### 2.6 Bağımlılıkları doğrula
 
 ```powershell
-$dll = "c:\Users\NAMLI\OneDrive\Masaüstü\GameNetworkingSockets-fork\build-win-static\bin\GameNetworkingSockets.dll"
+$dll = "C:\path\to\GameNetworkingSockets-fork\build-win-static\bin\GameNetworkingSockets.dll"
 $vcvars = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
 cmd /c "`"$vcvars`" x64 -vcvars_ver=14.44 >nul && dumpbin /dependents `"$dll`""
 ```
@@ -260,7 +260,7 @@ cmd /c "`"$vcvars`" x64 -vcvars_ver=14.44 >nul && dumpbin /dependents `"$dll`""
 ### 2.7 binding klasörüne kopyala
 
 ```powershell
-$repo = "c:\Users\NAMLI\OneDrive\Masaüstü\GameNetworkingSockets-fork"
+$repo = "C:\path\to\GameNetworkingSockets-fork"
 Copy-Item "$repo\build-win-static\bin\GameNetworkingSockets.dll" "$repo\bindings\csharp\native\win-x64\GameNetworkingSockets.dll" -Force
 ```
 
@@ -288,7 +288,7 @@ Copy-Item "$repo\build-win-static\bin\GameNetworkingSockets.dll" "$repo\bindings
 ### 3.2 Pack
 
 ```powershell
-$repo = "c:\Users\NAMLI\OneDrive\Masaüstü\GameNetworkingSockets-fork"
+$repo = "C:\path\to\GameNetworkingSockets-fork"
 & dotnet pack "$repo\bindings\csharp\GameNetworkingSockets.csproj" -c Release
 ```
 
@@ -297,7 +297,7 @@ Sonuç: `bindings\csharp\bin\Release\GameNetworkingSockets.CSharp.<sürüm>.nupk
 ### 3.3 Paket içeriğini doğrula
 
 ```powershell
-$nupkg = "c:\Users\NAMLI\OneDrive\Masaüstü\GameNetworkingSockets-fork\bindings\csharp\bin\Release\GameNetworkingSockets.CSharp.1.7.0.nupkg"
+$nupkg = "C:\path\to\GameNetworkingSockets-fork\bindings\csharp\bin\Release\GameNetworkingSockets.CSharp.1.7.0.nupkg"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [System.IO.Compression.ZipFile]::OpenRead($nupkg).Entries | Sort-Object FullName | Format-Table FullName, Length
 ```
@@ -313,7 +313,7 @@ Toplam paket boyutu ~7 MB civarı olmalı. Eğer 1 MB altındaysa native DLL'ler
 ### 3.4 Local feed'e push
 
 ```powershell
-& dotnet nuget push "c:\Users\NAMLI\OneDrive\Masaüstü\GameNetworkingSockets-fork\bindings\csharp\bin\Release\GameNetworkingSockets.CSharp.1.7.0.nupkg" --source "C:\local-nuget-source"
+& dotnet nuget push "C:\path\to\GameNetworkingSockets-fork\bindings\csharp\bin\Release\GameNetworkingSockets.CSharp.1.7.0.nupkg" --source "C:\local-nuget-source"
 ```
 
 ### 3.5 Tüketici tarafında doğrula
