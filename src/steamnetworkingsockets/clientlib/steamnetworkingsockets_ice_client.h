@@ -174,6 +174,10 @@ namespace SteamNetworkingSocketsLib {
     };
 
     const uint32 k_nSTUN_MaxPacketSize_Bytes = 576; //  RFC 5389 7.1
+    // RFC 5389 sec 15.3: the USERNAME attribute value MUST be less than 513 bytes.  (RFC 8489
+    // sec 14.3 tightens this to fewer than 509; we use the more permissive 5389 limit so we
+    // still accept any peer conforming to either.)  We reject anything longer on ingestion.
+    const uint32 k_nSTUN_MaxUsernameLen_Bytes = 512;
     const uint32 k_nSTUN_CookieValue = 0x2112A442;
     const uint32 k_nSTUN_BindingRequest = 0x0001;
     const uint32 k_nSTUN_BindingResponse = 0x0101;
@@ -300,6 +304,10 @@ namespace SteamNetworkingSocketsLib {
         bool BCanSendEndToEnd() const { return m_pSelectedCandidatePair != nullptr; }
 		int GetPing() const;
 
+        // Returns true if the address is on the same subnet as ANY of our local LAN/localhost
+        // adapters, not just one specific interface.  Used to classify a route as "probably local".
+        bool BIsAddressOnAnyLocalSubnet( const netadr_t &addr ) const;
+
         bool SendPacketGather( int nChunks, const iovec *pChunks, int cbSendTotal );
 
     protected:
@@ -328,12 +336,26 @@ namespace SteamNetworkingSocketsLib {
         {
             ICECandidatePairState m_nState;
             bool m_bNominated;
+            // True if this pair's local and remote endpoints are on the same LAN/localhost
+            // subnet -- i.e. a direct link.  Cached at construction; used to prefer such pairs
+            // during exploration/nomination (BIsPreferredRouteOver).
+            bool m_bLocalSubnet;
             uint64 m_nPriority;
             ICELocalCandidate m_localCandidate;
             ICEPeerCandidate m_remoteCandidate;
             CSteamNetworkingSocketsSTUNRequest *m_pPeerRequest;
 			int m_nLastRecordedPing;
             ICECandidatePair( const ICELocalCandidate& localCandidate, const ICEPeerCandidate& remoteCandidate, EICERole role );
+
+            // Route-selection preference: prefer a same-subnet (direct LAN) pair, then higher
+            // RFC 8445 pair priority.  Used for both check ordering and nomination.  This is a
+            // local policy only; the priorities we put on the wire stay RFC-standard.
+            bool BIsPreferredRouteOver( const ICECandidatePair &x ) const
+            {
+                if ( m_bLocalSubnet != x.m_bLocalSubnet )
+                    return m_bLocalSubnet;
+                return m_nPriority > x.m_nPriority;
+            }
         };
 
         CSteamNetworkingICESessionCallbacks *m_pCallbacks;

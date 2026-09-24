@@ -1,17 +1,51 @@
 name: Soak
-on: workflow_dispatch  # manual only — no auto build on push/PR
+on:
+  workflow_dispatch:  # manual only — no scheduled runs
+
+permissions:
+  actions: read
 
 jobs:
 
+  check-for-changes:
+    name: Check for new commits
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Determine whether soak tests need to run
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Manual runs always run.  Scheduled runs only run if there's a new
+          # commit since the last successful scheduled/manual run, so we don't
+          # burn hours of runner time re-soaking an unchanged tree every night.
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LAST_SHA=$(gh api --method GET "repos/${{ github.repository }}/actions/workflows/soak.yml/runs" \
+            -f status=success -f branch="${{ github.ref_name }}" --jq '.workflow_runs[0].head_sha')
+          echo "Last successful run: $LAST_SHA"
+          echo "Current HEAD:        ${{ github.sha }}"
+          if [ "$LAST_SHA" = "${{ github.sha }}" ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
   soak-ubuntu:
     name: Ubuntu
+    needs: check-for-changes
+    if: needs.check-for-changes.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     env:
       CI_BUILD: 1
       IMAGE: ubuntu
       IMAGE_TAG: noble
     steps:
-      - uses: actions/checkout@main
+      - uses: actions/checkout@v4
       - name: Update packages
         run: sudo -E bash .github/update-packages.sh
       - name: Install dependencies
@@ -37,13 +71,15 @@ jobs:
 
   soak-windows:
     name: Windows
+    needs: check-for-changes
+    if: needs.check-for-changes.outputs.should_run == 'true'
     runs-on: windows-2025
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-bincache
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-bincache,readwrite
     steps:
-      - uses: actions/checkout@main
+      - uses: actions/checkout@v4
 
       - name: Configure Git
         run: git config --global --add safe.directory '*'
@@ -106,6 +142,8 @@ jobs:
 
   soak-macos:
     name: macOS
+    needs: check-for-changes
+    if: needs.check-for-changes.outputs.should_run == 'true'
     runs-on: macos-latest
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg

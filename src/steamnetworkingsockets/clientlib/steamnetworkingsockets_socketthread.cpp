@@ -77,6 +77,7 @@ constexpr int k_cbETWEventUDPPacketDataSize = 16;
 	#define CMSGHDR WSACMSGHDR
 	#define CMSG_FIRSTHDR WSA_CMSG_FIRSTHDR
 	#define CMSG_NXTHDR WSA_CMSG_NXTHDR
+	#define CMSG_LEN WSA_CMSG_LEN
 #endif
 
 #ifdef _WIN32
@@ -3402,7 +3403,7 @@ static void SteamNetworkingThreadProc()
 		}
 		__try
 		{
-			RaiseException( 0x406D1388, 0, sizeof(info)/sizeof(DWORD), (ULONG_PTR*)&info );
+			RaiseException( 0x406D1388, 0, sizeof(info)/sizeof(ULONG_PTR), (ULONG_PTR*)&info );
 		}
 		__except(EXCEPTION_CONTINUE_EXECUTION)
 		{
