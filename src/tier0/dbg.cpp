@@ -55,7 +55,7 @@ bool Plat_IsInDebugSession()
 #ifdef _WIN32
 	return (IsDebuggerPresent() != 0);
 #elif IsOSX() || IsIOS() || IsTVOS()
-	// All Darwin targets share the same sysctl(KERN_PROC) debugger check.
+	// Apple TN2151 / QA1361.  The same sysctl works on macOS, iOS and tvOS.
 	int mib[4];
 	struct kinfo_proc info;
 	size_t size;

@@ -26,6 +26,26 @@ project(GameNetworkingSockets C CXX)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
+# Keep in sync with vcpkg.json.  Only used to stamp the Apple framework bundle.
+set(GNS_VERSION "1.6.0")
+
+#
+# Apple platforms.  CMAKE_SYSTEM_NAME is "Darwin" for macOS but "iOS", "tvOS",
+# "watchOS" or "visionOS" when cross-compiling with CMake's built-in Apple
+# support.  Everything except macOS is an "embedded" Apple platform: no
+# command-line executables, and shared libraries have to be packaged as
+# frameworks to be loadable from an app bundle.
+#
+if(APPLE)
+	if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+		set(GNS_APPLE_EMBEDDED FALSE)
+	else()
+		set(GNS_APPLE_EMBEDDED TRUE)
+	endif()
+else()
+	set(GNS_APPLE_EMBEDDED FALSE)
+endif()
+
 include(DefaultBuildType)
 find_package(Sanitizers)
 
@@ -42,7 +62,22 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
 endif()
 
 option(BUILD_STATIC_LIB "Build the static link version of the client library" ON)
-option(BUILD_SHARED_LIB "Build the shared library version of the client library" ON)
+
+# On iOS/tvOS/watchOS/visionOS the supported way to ship a dynamic library
+# inside an app bundle is a framework: that is what Xcode's "Embed & Sign" and
+# the App Store tooling are built around.  A bare .dylib can be embedded and
+# loaded, but you have to arrange the embedding and signing yourself.  So the
+# shared library is off by default there, and turning it on gives you a
+# framework unless you explicitly ask for BUILD_FRAMEWORK=OFF.
+if(GNS_APPLE_EMBEDDED)
+	set(GNS_BUILD_SHARED_LIB_DEFAULT OFF)
+else()
+	set(GNS_BUILD_SHARED_LIB_DEFAULT ON)
+endif()
+option(BUILD_SHARED_LIB "Build the shared library version of the client library" ${GNS_BUILD_SHARED_LIB_DEFAULT})
+cmake_dependent_option(BUILD_FRAMEWORK
+	"On Apple platforms, build the shared library as a .framework bundle instead of a bare dylib"
+	${GNS_APPLE_EMBEDDED} "APPLE AND BUILD_SHARED_LIB" OFF)
 option(BUILD_EXAMPLES "Build the included examples" OFF)
 option(BUILD_TESTS "Build crypto, pki and network connection tests" OFF)
 option(BUILD_TOOLS "Build cert management tool" OFF)
@@ -153,10 +188,15 @@ function(set_target_common_gns_properties TGT)
 
 	if(CMAKE_SYSTEM_NAME MATCHES Linux)
 		target_compile_definitions(${TGT} PUBLIC LINUX)
-	elseif(APPLE)
-		# Covers macOS (Darwin) and the other Apple platforms (iOS, tvOS, visionOS):
-		# CMAKE_SYSTEM_NAME is "iOS"/"tvOS"/etc. there, not "Darwin", so match the
-		# APPLE family flag instead of the name. GNS's POSIX/OSX path works on all of them.
+	elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+		# minbase_identify.h works this out from <TargetConditionals.h>; this is
+		# for the handful of places that test the bare IOS macro directly.
+		target_compile_definitions(${TGT} PUBLIC IOS)
+	elseif(CMAKE_SYSTEM_NAME STREQUAL "tvOS")
+		target_compile_definitions(${TGT} PUBLIC TVOS)
+	elseif(CMAKE_SYSTEM_NAME STREQUAL "watchOS")
+		target_compile_definitions(${TGT} PUBLIC WATCHOS)
+	elseif(CMAKE_SYSTEM_NAME MATCHES Darwin)
 		target_compile_definitions(${TGT} PUBLIC OSX)
 	elseif(CMAKE_SYSTEM_NAME MATCHES FreeBSD)
 		target_compile_definitions(${TGT} PUBLIC FREEBSD)
@@ -204,6 +244,13 @@ function(set_target_common_gns_properties TGT)
 		CXX_STANDARD 11
 	)
 endfunction()
+
+if(GNS_APPLE_EMBEDDED AND (BUILD_EXAMPLES OR BUILD_TESTS OR BUILD_TOOLS))
+	message(FATAL_ERROR
+		"BUILD_EXAMPLES/BUILD_TESTS/BUILD_TOOLS produce command-line programs, which "
+		"cannot be built or run for ${CMAKE_SYSTEM_NAME}.  Configure a separate macOS "
+		"build directory for those.")
+endif()
 
 if(BUILD_EXAMPLES)
 	if ( NOT BUILD_SHARED_LIB )

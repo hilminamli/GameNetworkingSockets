@@ -14,7 +14,7 @@ The package isn't published to npm; install it from a tarball or local path.
 
 ```bash
 # from a packed tarball (recommended for deploy):
-npm install ./gamenetworkingsockets-0.1.0.tgz
+npm install ./gamenetworkingsockets-0.1.1.tgz
 
 # or directly from the local binding folder:
 npm install /path/to/GameNetworkingSockets-fork/bindings/nodejs
@@ -36,6 +36,9 @@ npm install        # installs deps (no native build — install script removed)
 npm run build      # node-gyp rebuild + tsc
 npm run prebuild   # emit prebuilds/<platform>-<arch>/ for distribution
 ```
+
+`dist/index.js` and `dist/index.d.ts` are committed so the local-path install works without a
+build step; after changing `src-ts/index.ts`, run `npm run build:ts` and commit them too.
 
 Run `npm run build && npm run prebuild` once **on each target platform** (Windows, then Linux/WSL),
 then `npm pack` to bundle all collected prebuilds into one tarball.

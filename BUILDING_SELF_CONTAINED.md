@@ -212,13 +212,15 @@ $vcvars = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\
 $cmake = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 $ninja = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
 
-cmd /c "`"$vcvars`" x64 -vcvars_ver=14.44 && `"$cmake`" -S `"$repo`" -B `"$repo\build-win-static`" -G Ninja -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static-md -DBUILD_SHARED_LIBS=ON -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DProtobuf_USE_STATIC_LIBS=ON"
+cmd /c "`"$vcvars`" x64 -vcvars_ver=14.44 && `"$cmake`" -S `"$repo`" -B `"$repo\build-win-static`" -G Ninja -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static-md -DVCPKG_INSTALLED_DIR=C:/gns-vcpkg/installed -DBUILD_SHARED_LIB=ON -DBUILD_STATIC_LIB=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_TOOLS=OFF -DENABLE_ICE=ON -DUSE_STEAMWEBRTC=OFF -DProtobuf_USE_STATIC_LIBS=ON"
 ```
 
 **KRİTİK FLAG'LER:**
 - `VCPKG_TARGET_TRIPLET=x64-windows-static-md` — bağımlılıklar static, ama CRT shared (modern Windows uyumlu)
 - `Protobuf_USE_STATIC_LIBS=ON` — `PROTOBUF_USE_DLLS` define'ını engellemek için. Yoksa "unresolved external `__declspec(dllimport)`" linker hatası alırsın.
-- `BUILD_SHARED_LIBS=ON` — GNS'i DLL olarak derle (içine bağımlılıklar gömülü)
+- `BUILD_SHARED_LIB=ON`, `BUILD_STATIC_LIB=OFF` — GNS'i DLL olarak derle (içine bağımlılıklar gömülü)
+- `ENABLE_ICE=ON`, `USE_STEAMWEBRTC=OFF` — P2P için native ICE istemcisi (STUN + TURN); webrtc submodule'ü gerekmez
+- `VCPKG_INSTALLED_DIR` — ASCII (Türkçe karakter içermeyen) bir yol olmalı. Bkz. Bölüm 4, `LNK1104`.
 - `-vcvars_ver=14.44` — yeni MSVC toolset'i zorla. Bu olmadan eski 14.38 kullanılır ve `__std_find_first_of_trivial_pos_1` gibi STL sembol hataları alırsın.
 
 Configure cache'de `CMAKE_CXX_COMPILER` doğru sürümü göstermelidir:
@@ -345,6 +347,10 @@ Build output (`bin/Debug/net6.0/`) altında **sadece** şunlar olmalı (GNS ile 
 ### `unresolved external symbol __std_find_first_of_trivial_pos_1` (veya benzeri `__std_*`)
 
 MSVC toolset eski (14.38 vs.). vcpkg paketleri yeni STL sembollerine ihtiyaç duyar. **Çözüm:** Bölüm 2.3 ve 2.4 — `vcvars_ver=14.44` ile yeni toolset zorla.
+
+### `LNK1104: cannot open file '...MasaÃ¼stÃ¼...\utf8_validity.lib'` (vcpkg protobuf build)
+
+Repo yolu ASCII olmayan karakter içeriyor (ör. `Masaüstü`). vcpkg bir bağımlılığı binary cache'ten bulamayıp sıfırdan derlediğinde, protobuf'un linker response dosyası bu yolu bozuk kodlamayla okuyor. **Çözüm:** `-DVCPKG_INSTALLED_DIR=<ASCII bir yol>` ver (Bölüm 2.4) veya repoyu ASCII bir yola taşı.
 
 ### `cmake: command not found`
 

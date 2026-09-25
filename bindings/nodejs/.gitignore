@@ -1,7 +1,12 @@
 # Dependencies and build output (all reproducible)
 node_modules/
 build/
-dist/
 *.tgz
+
+# dist/: only the package entry points are committed, so installing from a local path
+# works without a build step. Compiled tests stay local.
+dist/*
+!dist/index.js
+!dist/index.d.ts
 
 # Keep: prebuilds/ (shipped binaries), src/, src-ts/, *.json, binding.gyp, README.md, native/

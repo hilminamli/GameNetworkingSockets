@@ -5,6 +5,8 @@ name: Linux flavors
 # Triggered from the main CI build workflow
 on:
   workflow_dispatch:  # manual only — no auto chain off the Ubuntu build
+  #workflow_call:
+  #repository_dispatch:
   #  types: [ build-linux-flavors ]
 
 jobs:
@@ -55,7 +57,7 @@ jobs:
             docker_tag: latest
             ci_dist_upgrade: 0
     steps:
-      - uses: actions/checkout@main
+      - uses: actions/checkout@v4
       - name: Launch container
         run: |
           docker run -d --rm --name github-docker-builder -e LC_ALL="C" -e LANG="C" -v ${{ github.workspace }}:/build -w /build ${{ matrix.docker_image }}:${{ matrix.docker_tag }} tail -f /dev/null
