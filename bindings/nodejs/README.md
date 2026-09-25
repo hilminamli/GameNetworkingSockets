@@ -37,6 +37,9 @@ npm run build      # node-gyp rebuild + tsc
 npm run prebuild   # emit prebuilds/<platform>-<arch>/ for distribution
 ```
 
+`dist/index.js` and `dist/index.d.ts` are committed so the local-path install works without a
+build step; after changing `src-ts/index.ts`, run `npm run build:ts` and commit them too.
+
 Run `npm run build && npm run prebuild` once **on each target platform** (Windows, then Linux/WSL),
 then `npm pack` to bundle all collected prebuilds into one tarball.
 
