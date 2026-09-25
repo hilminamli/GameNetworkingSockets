@@ -3,8 +3,14 @@
 # against AL2023's glibc (2.34) and runs on hosts with glibc >= 2.34 (e.g. Amazon Linux
 # 2023). A .so built on Ubuntu 24.04 (glibc 2.39) fails there with "GLIBC_2.38 not found".
 #
-# Run from the fork root on the Docker host:
-#     docker run --rm -v "$PWD":/src -w /work amazonlinux:2023 bash /src/build-linux-al2023.sh
+# Run from the fork root on the Docker host (the named volume keeps vcpkg and its
+# binary cache between runs; from Git Bash, prefix with MSYS_NO_PATHCONV=1):
+#     docker run --rm -v "$PWD":/src -v gns-vcpkg-al2023:/work -w /work \
+#         amazonlinux:2023 bash /src/build-linux-al2023.sh
+#
+# Builds the published master by default. To build an unpushed local branch, clone
+# from the bind-mounted repo instead:
+#     ... -e GNS_REPO=file:///src -e GNS_REF=<branch> amazonlinux:2023 ...
 #
 # Output: /src/bindings/csharp/native/linux-x64/libGameNetworkingSockets.so
 # (also copied to /src/build-out/ for convenience).
@@ -12,6 +18,9 @@
 # get SIGPIPE when head closes early, which under pipefail aborts the whole script
 # right after the first echo (the "stops after glibc" symptom). Keep -e -u only.
 set -eu
+
+GNS_REPO="${GNS_REPO:-https://github.com/hilminamli/GameNetworkingSockets.git}"
+GNS_REF="${GNS_REF:-master}"
 
 echo "=== glibc of this build environment (must be <= 2.34) ==="
 ldd --version | head -1 || true
@@ -29,6 +38,9 @@ echo "=== toolchain installed OK ==="
 # vcpkg needs a writable checkout; build deps from source so they also target glibc 2.34.
 echo "=== bootstrap vcpkg ==="
 export VCPKG_ROOT=/work/vcpkg
+# Keep built packages on the /work volume so later runs skip rebuilding the deps.
+export VCPKG_DEFAULT_BINARY_CACHE=/work/vcpkg-bincache
+mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
 if [ ! -x "$VCPKG_ROOT/vcpkg" ]; then
     git clone --quiet https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
     "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics >/dev/null
@@ -38,10 +50,11 @@ fi
 # (/src). A recursive copy of the fork over the Docker Desktop file-sharing layer hangs
 # on the webrtc/abseil submodules (thousands of files) — clone is fast and stays on the
 # fast container fs. The mount is used only to write the output .so back out at the end.
-echo "=== clone source into container (avoids slow bind-mount copy) ==="
+echo "=== clone $GNS_REPO ($GNS_REF) into container (avoids slow bind-mount copy) ==="
 rm -rf /work/gns
-git clone --quiet --depth 1 \
-    https://github.com/hilminamli/GameNetworkingSockets.git /work/gns
+# The bind-mounted repo is owned by another uid; let git read it.
+git config --global --add safe.directory '*'
+git clone --quiet --depth 1 --branch "$GNS_REF" "$GNS_REPO" /work/gns
 cd /work/gns
 # Native ICE (USE_STEAMWEBRTC=OFF) needs abseil + vjson but NOT the huge webrtc
 # submodule — init only what's required so the clone stays small and fast.
