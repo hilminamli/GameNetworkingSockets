@@ -14,7 +14,7 @@ The package isn't published to npm; install it from a tarball or local path.
 
 ```bash
 # from a packed tarball (recommended for deploy):
-npm install ./gamenetworkingsockets-0.1.0.tgz
+npm install ./gamenetworkingsockets-0.1.1.tgz
 
 # or directly from the local binding folder:
 npm install /path/to/GameNetworkingSockets-fork/bindings/nodejs
