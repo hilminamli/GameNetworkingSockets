@@ -16,6 +16,12 @@ namespace GameNetworkingSockets
         internal const int DefaultServerMessageBufferSize = 256;
         /// <summary>Size of SteamNetConnectionRealTimeStatus_t in bytes. Identical on Windows and Linux x64 (no int64 alignment gap under either pack rule).</summary>
         internal const int RealTimeStatusStructSize = 120;
+        /// <summary>Size of SteamNetConnectionInfo_t in bytes. Identical on Windows and Linux x64.</summary>
+        internal const int ConnectionInfoStructSize = 696;
+        /// <summary>Offset of SteamNetConnectionInfo_t::m_nFlags: after the remote identity (136), user data (8),
+        /// listen socket (4), remote address (18) and its pad (2), the two POP ids (8), state and end reason (8),
+        /// and the end-debug and description strings (128 each).</summary>
+        internal const int ConnectionInfoFlagsOffset = 440;
         /// <summary>Size of the byte buffer passed to SteamAPI_SteamNetworkingIPAddr_ToString for the resulting string.</summary>
         internal const int IPAddrStringBufferSize   = 64;
     }

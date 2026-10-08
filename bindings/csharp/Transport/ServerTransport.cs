@@ -144,5 +144,11 @@ namespace GameNetworkingSockets.Transport
             if (_server != null) return _server.GetConnectionStats(hConn, out stats);
             stats = default; return false;
         }
+
+        internal bool GetConnectionFlags(uint hConn, out ConnectionFlags flags)
+        {
+            if (_server != null) return _server.GetConnectionFlags(hConn, out flags);
+            flags = ConnectionFlags.None; return false;
+        }
     }
 }

@@ -132,6 +132,13 @@ namespace GameNetworkingSockets.Transport
             return _client.GetConnectionStats(_client.Connection, out stats);
         }
 
+        /// <summary>Returns how the active connection travels (relayed, a LAN, ...). Returns false if not connected.</summary>
+        public bool GetConnectionFlags(out ConnectionFlags flags)
+        {
+            if (_client.Connection == 0) { flags = ConnectionFlags.None; return false; }
+            return _client.GetConnectionFlags(_client.Connection, out flags);
+        }
+
         public void Dispose()
         {
             _client.Dispose();

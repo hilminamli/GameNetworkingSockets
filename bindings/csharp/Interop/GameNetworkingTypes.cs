@@ -110,6 +110,30 @@ namespace GameNetworkingSockets
         public const int All     = 0x7fffffff;
     }
 
+    /// <summary>
+    /// How a connection travels: SteamNetConnectionInfo_t::m_nFlags (k_nSteamNetworkConnectionInfoFlags_*),
+    /// read with <see cref="NetworkingSockets.GetConnectionFlags"/>. A P2P (ICE) connection through a
+    /// TURN server is <see cref="Relayed"/>; one between two host candidates (the same LAN) is
+    /// <see cref="Fast"/>; a hole-punched or public UDP path is neither.
+    /// </summary>
+    [Flags]
+    public enum ConnectionFlags : int
+    {
+        None            = 0,
+        /// <summary>The remote identity was not authenticated.</summary>
+        Unauthenticated = 1,
+        /// <summary>The traffic is not encrypted.</summary>
+        Unencrypted     = 2,
+        /// <summary>Internal loopback buffers: the connection never leaves the process.</summary>
+        LoopbackBuffers = 4,
+        /// <summary>A fast path: loopback, or for ICE two host candidates (a LAN).</summary>
+        Fast            = 8,
+        /// <summary>Relayed (SDR or TURN).</summary>
+        Relayed         = 16,
+        /// <summary>Dual-wifi multi-path in use.</summary>
+        DualWifi        = 32,
+    }
+
     public enum DebugOutputType : int
     {
         None        = 0,

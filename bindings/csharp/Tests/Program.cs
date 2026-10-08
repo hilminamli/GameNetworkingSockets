@@ -26,6 +26,7 @@ runner.Add(new SendReceiveTest());
 runner.Add(new ReliabilityTest());
 runner.Add(new LargeMessageTest());
 runner.Add(new StatsTest());
+runner.Add(new ConnectionFlagsTest());
 runner.Add(new OffsetProbeTest());
 runner.Add(new DisconnectTest());
 runner.Add(new StressTest());

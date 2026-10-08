@@ -210,6 +210,21 @@ namespace GameNetworkingSockets
             return true;
         }
 
+        /// <summary>Reads how the connection travels (relayed, a LAN, ...): SteamNetConnectionInfo_t::m_nFlags.
+        /// Returns false if the handle is not a connection. A P2P connection's flags follow the
+        /// route ICE has picked, so they can change while it settles.</summary>
+        public unsafe bool GetConnectionFlags(uint hConn, out ConnectionFlags flags)
+        {
+            flags = ConnectionFlags.None;
+            if (_disposed) return false;
+
+            byte* buf = stackalloc byte[NetworkingConstants.ConnectionInfoStructSize];
+            if (!Native.SteamAPI_ISteamNetworkingSockets_GetConnectionInfo(_iface, hConn, (IntPtr)buf)) return false;
+
+            flags = (ConnectionFlags)(*(int*)(buf + NetworkingConstants.ConnectionInfoFlagsOffset));
+            return true;
+        }
+
         // ── Utilities ────────────────────────────────────────────────────────────
 
         /// <summary>Parses an IP address string (e.g. "127.0.0.1:27015") into a SteamNetworkingIPAddr. Throws on invalid input.</summary>

@@ -36,5 +36,8 @@ namespace GameNetworkingSockets.Transport
 
         /// <summary>Returns the full real-time stats block (rates, queues, loss). Returns false if unavailable.</summary>
         bool GetConnectionStats(out ConnectionStats stats);
+
+        /// <summary>Returns how the connection travels (relayed, a LAN, ...). Returns false if unavailable.</summary>
+        bool GetConnectionFlags(out ConnectionFlags flags);
     }
 }
