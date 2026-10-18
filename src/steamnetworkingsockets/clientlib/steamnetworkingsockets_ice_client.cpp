@@ -343,6 +343,19 @@ static const STUNAttribute* FindAttributeOfType( const STUNAttribute *pAttrs, ui
     return nullptr;
 }
 
+// 0 for a success response; for an error response its ERROR-CODE (RFC 5389 section 15.6),
+// or -1 if it carries none.
+static int STUNErrorCode( const RecvSTUNPktInfo_t &info )
+{
+    if ( info.m_pHeader == nullptr || ( info.m_pHeader->m_nMessageType & k_nSTUN_ClassMask ) != k_nSTUN_ClassErrorResponse )
+        return 0;
+    const STUNAttribute *pErrorAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nSTUN_Attr_ErrorCode );
+    if ( pErrorAttr == nullptr || pErrorAttr->m_nLength < 4 )
+        return -1;
+    const uint8 *pErrBytes = reinterpret_cast<const uint8*>( pErrorAttr->m_pData );
+    return ( pErrBytes[2] & 0x07 ) * 100 + pErrBytes[3];
+}
+
 
 static uint32* ReserveFingerprintAttribute( uint32 *pBuffer )
 {
@@ -2102,22 +2115,46 @@ void CSteamNetworkingICESession::STUNRequestCallback_RefreshAllocation( const Re
 
     if ( info.m_pHeader != nullptr )
     {
-        // Refresh succeeded -- parse the returned LIFETIME and schedule the next one.
-        const STUNAttribute *pLifetimeAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nTURN_Attr_Lifetime );
-        if ( pLifetimeAttr != nullptr && pLifetimeAttr->m_nLength == 4 )
+        const int nError = STUNErrorCode( info );
+        if ( nError == 0 )
         {
-            SteamNetworkingMicroseconds usecLifetime = (SteamNetworkingMicroseconds)ntohl( pLifetimeAttr->m_pData[0] ) * k_nMillion;
+            // Refresh succeeded -- parse the returned LIFETIME and schedule the next one.
+            // Without one, the default lifetime: the next refresh must still come.
+            SteamNetworkingMicroseconds usecLifetime = k_usecTURNDefaultLifetime;
+            const STUNAttribute *pLifetimeAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nTURN_Attr_Lifetime );
+            if ( pLifetimeAttr != nullptr && pLifetimeAttr->m_nLength == 4 )
+                usecLifetime = (SteamNetworkingMicroseconds)ntohl( pLifetimeAttr->m_pData[0] ) * k_nMillion;
             pIntf->m_usecRefreshAfter = info.m_usecNow + usecLifetime / 2;
+            pIntf->m_nTURNNonceRetries = 0;
+            return;
         }
-        return;
+
+        // Refused for its nonce: once more, with the server's new one.  (An error response
+        // used to count as success, and with no LIFETIME in it no refresh was ever sent
+        // again: the allocation ran out a few minutes later.)
+        if ( TakeTURNNonce( pIntf, info ) )
+        {
+            pIntf->m_usecRefreshAfter = info.m_usecNow;
+            return;
+        }
+
+        // Refused otherwise (437 Allocation Mismatch: the server has no allocation for us).
+        SpewMsg( "ICE: TURN Refresh refused (%d) by %s -- tearing down relay allocation\n",
+            nError, CUtlNetAdrRender( pIntf->m_addrTURNServer ).String() );
+    }
+    else
+    {
+        SpewMsg( "ICE: TURN Refresh timed out for %s -- tearing down relay allocation\n",
+            CUtlNetAdrRender( pIntf->m_addrTURNServer ).String() );
     }
 
-    // Refresh timed out -- the allocation is gone.  Tear down relay state so
-    // Think_DiscoverRelayCandidate will re-allocate, and remove all candidate
-    // pairs that depended on this relay.
-    SpewMsg( "ICE: TURN Refresh timed out for %s -- tearing down relay allocation\n",
-        CUtlNetAdrRender( pIntf->m_addrTURNServer ).String() );
+    // The allocation is gone: allocate again.
+    TearDownRelayAllocation( pIntf );
+}
 
+void CSteamNetworkingICESession::TearDownRelayAllocation( ICESessionInterface *pIntf )
+{
+    // Remove all candidate pairs that depended on this relay.
     for ( int j = len( m_vecCandidatePairs ) - 1; j >= 0; --j )
     {
         ICECandidatePair *pPair = m_vecCandidatePairs[j];
@@ -2132,7 +2169,45 @@ void CSteamNetworkingICESession::STUNRequestCallback_RefreshAllocation( const Re
     pIntf->m_addrTURNServer.Clear();   // clears "discovery done" signal; re-allocation starts next tick
     pIntf->m_usecRefreshAfter  = 0;
     pIntf->m_nTURNPermissionRevision = 0;
+    pIntf->m_usecPermissionRefreshAfter = 0;
+    pIntf->m_nTURNNonceRetries = 0;
     // Leave m_bRelayFailed = false so Think_DiscoverRelayCandidate retries.
+}
+
+bool CSteamNetworkingICESession::TakeTURNNonce( ICESessionInterface *pIntf, const RecvSTUNPktInfo_t &info )
+{
+    const int nError = STUNErrorCode( info );
+    if ( nError != 438 && nError != 401 )
+        return false;
+    if ( pIntf->m_strTURNRealm.empty() || pIntf->m_nTURNNonceRetries >= k_nTURNMaxNonceRetries )
+        return false;
+    const STUNAttribute *pNonceAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nSTUN_Attr_Nonce );
+    if ( pNonceAttr == nullptr )
+        return false;
+
+    const STUNAttribute *pRealmAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nSTUN_Attr_Realm );
+    if ( pRealmAttr != nullptr )
+    {
+        std::string strRealm( reinterpret_cast<const char*>( pRealmAttr->m_pData ), pRealmAttr->m_nLength );
+        if ( strRealm != pIntf->m_strTURNRealm )
+        {
+            // A new realm changes the key: MD5(username:realm:password).
+            const int nSrvIdx = index_of( m_vecTURNServers, pIntf->m_addrTURNServer );
+            if ( nSrvIdx < 0 )
+                return false;
+            const TURNCredentials &cred = m_vecTURNCredentials[ nSrvIdx ];
+            pIntf->m_strTURNRealm = strRealm;
+            std::string strKeyInput = cred.m_strUsername + ":" + pIntf->m_strTURNRealm + ":" + cred.m_strPassword;
+            CCrypto::GenerateMD5Digest( strKeyInput.c_str(), strKeyInput.size(), &pIntf->m_arrTURNKey );
+        }
+    }
+
+    ++pIntf->m_nTURNNonceRetries;
+    pIntf->m_strTURNNonce.assign( reinterpret_cast<const char*>( pNonceAttr->m_pData ), pNonceAttr->m_nLength );
+    SpewVerboseGroup( GlobalConfig::LogLevel_P2PRendezvous.Get(),
+        "ICE: TURN server %s sent %d -- retrying with its new nonce.\n",
+        CUtlNetAdrRender( pIntf->m_addrTURNServer ).String(), nError );
+    return true;
 }
 
 void CSteamNetworkingICESession::Think_TURNMaintenance( SteamNetworkingMicroseconds usecNow )
@@ -2157,8 +2232,14 @@ void CSteamNetworkingICESession::Think_TURNMaintenance( SteamNetworkingMicroseco
         const std_vector<CIPAddress> &vecPermitted = bIsIPv4 ? m_vecTURNPermittedIPv4 : m_vecTURNPermittedIPv6;
         int nSessionRevision = bIsIPv4 ? m_nTURNPermissionRevisionIPv4 : m_nTURNPermissionRevisionIPv6;
 
-        if ( pIntf->m_nTURNPermissionRevision >= nSessionRevision || vecPermitted.empty() )
+        // CreatePermission when IPs have been added since the last one, and again before the
+        // last one lapses: the server forgets a permission after 300 s, and from then on
+        // drops whatever the peer sends through the relay.
+        const bool bNewPeers = pIntf->m_nTURNPermissionRevision < nSessionRevision;
+        const bool bLapsing = pIntf->m_usecPermissionRefreshAfter != 0 && usecNow >= pIntf->m_usecPermissionRefreshAfter;
+        if ( vecPermitted.empty() || ( !bNewPeers && !bLapsing ) )
             continue;
+        pIntf->m_usecPermissionRefreshAfter = 0; // the callback schedules the next one
 
         // Build one XOR-PEER-ADDRESS attribute per permitted IP.
         // STUNAttribute is a non-owning view; back the data in stack buffers.
@@ -2212,6 +2293,7 @@ void CSteamNetworkingICESession::Think_TURNMaintenance( SteamNetworkingMicroseco
                 AssertMsg( false, "TURN server address not in m_vecTURNServers" );
                 delete pRequest;
                 pIntf->m_pPendingSTUNRequest = nullptr;
+                pIntf->m_usecPermissionRefreshAfter = usecNow + k_usecTURNRetry;
                 continue;
             }
             const std::string &strUsername = m_vecTURNCredentials[ nSrvIdx ].m_strUsername;
@@ -2256,8 +2338,29 @@ void CSteamNetworkingICESession::STUNRequestCallback_CreatePermission( const Rec
 
     if ( info.m_pHeader == nullptr )
     {
-        // Timed out.  m_nTURNPermissionRevision is still stale, so Think_TURNMaintenance
-        // will retry on the next Think() sweep.
+        // Timed out.  If it was for new IPs, m_nTURNPermissionRevision is still stale and
+        // Think_TURNMaintenance retries on the next sweep; if it was the refresh, it goes
+        // again shortly.
+        pIntf->m_usecPermissionRefreshAfter = info.m_usecNow + k_usecTURNRetry;
+        return;
+    }
+
+    const int nError = STUNErrorCode( info );
+    if ( nError != 0 )
+    {
+        // Refused for its nonce: send again at once with the server's new one (the revision
+        // is left as it was).  An error response used to count as success, and the
+        // permission was never there.
+        if ( TakeTURNNonce( pIntf, info ) )
+        {
+            pIntf->m_usecPermissionRefreshAfter = info.m_usecNow;
+            return;
+        }
+        SpewMsg( "ICE: TURN CreatePermission refused (%d) by %s\n",
+            nError, CUtlNetAdrRender( pIntf->m_addrTURNServer ).String() );
+        // Refused otherwise: not again every sweep, but again in a while.
+        pIntf->m_nTURNPermissionRevision = info.m_pRequest->m_nTURNPermissionRevision;
+        pIntf->m_usecPermissionRefreshAfter = info.m_usecNow + 5 * k_usecTURNRetry;
         return;
     }
 
@@ -2265,6 +2368,10 @@ void CSteamNetworkingICESession::STUNRequestCallback_CreatePermission( const Rec
     // If more IPs arrived while the request was in flight, the revision will still be
     // behind the session's current revision, and we'll send another CreatePermission.
     pIntf->m_nTURNPermissionRevision = info.m_pRequest->m_nTURNPermissionRevision;
+    pIntf->m_nTURNNonceRetries = 0;
+
+    // And again before the permission lapses.
+    pIntf->m_usecPermissionRefreshAfter = info.m_usecNow + k_usecTURNPermissionRefresh;
 }
 
 void CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveCandidate( const RecvSTUNPktInfo_t &info )

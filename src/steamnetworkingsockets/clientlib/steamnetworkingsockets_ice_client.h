@@ -117,6 +117,17 @@ namespace SteamNetworkingSocketsLib {
         // new CreatePermission sweep is needed.
         int m_nTURNPermissionRevision = 0;
 
+        // When to send CreatePermission again for the IPs already permitted.  A TURN
+        // permission lasts 300 seconds unless it is sent again (RFC 5766 section 8); once
+        // it lapses the relay drops the peer's packets and the connection times out.
+        // Zero means none is due: nothing permitted yet, or a request in flight.
+        SteamNetworkingMicroseconds m_usecPermissionRefreshAfter = 0;
+
+        // TURN requests refused in a row for their nonce (401 / 438 Stale Nonce).  Each
+        // takes the server's new nonce and goes again; past a few, the credentials
+        // themselves are refused and we stop retrying.
+        int m_nTURNNonceRetries = 0;
+
         /// Send a packet through this interface to the destination remote address.
         /// If relay address is non-zero, send via Send Indication to the TURN server
         bool SendPacketGather( int nChunks, const iovec *pChunks, int cbPayload, const netadr_t &addrPeer, const netadr_t &addrRelay );
@@ -213,6 +224,17 @@ namespace SteamNetworkingSocketsLib {
     const uint32 k_nTURN_Attr_Data               = 0x0013;
     const uint32 k_nTURN_Attr_XORRelayedAddress  = 0x0016;
     const uint32 k_nTURN_Attr_RequestedTransport = 0x0019;
+
+    // A STUN message type's class bits (C1 = 0x0100, C0 = 0x0010); both set is an error response.
+    const uint32 k_nSTUN_ClassMask          = 0x0110;
+    const uint32 k_nSTUN_ClassErrorResponse = 0x0110;
+
+    // TURN upkeep.  A permission lasts 300 s and is sent again a minute before it lapses;
+    // an allocation's lifetime comes in its responses, 600 s by default (RFC 5766).
+    const SteamNetworkingMicroseconds k_usecTURNPermissionRefresh = 240 * k_nMillion;
+    const SteamNetworkingMicroseconds k_usecTURNDefaultLifetime   = 600 * k_nMillion;
+    const SteamNetworkingMicroseconds k_usecTURNRetry             = 2 * k_nMillion;
+    const int k_nTURNMaxNonceRetries = 3;
 
 
     enum STUNPacketEncodingFlags
@@ -505,6 +527,16 @@ namespace SteamNetworkingSocketsLib {
         void STUNRequestCallback_AllocateRelay( const RecvSTUNPktInfo_t &info );
         void STUNRequestCallback_RefreshAllocation( const RecvSTUNPktInfo_t &info );
         void STUNRequestCallback_CreatePermission( const RecvSTUNPktInfo_t &info );
+
+        // A TURN request refused for its nonce (438 Stale Nonce, or 401 with a fresh
+        // challenge): take the server's new nonce -- and realm, re-deriving the key if it
+        // changed -- so the request can go again.  False if it was refused for anything
+        // else, or after k_nTURNMaxNonceRetries in a row.
+        bool TakeTURNNonce( ICESessionInterface *pIntf, const RecvSTUNPktInfo_t &info );
+
+        // Drop the relay allocation and every candidate pair that used it, so
+        // Think_DiscoverRelayCandidate allocates again.
+        void TearDownRelayAllocation( ICESessionInterface *pIntf );
         void STUNRequestCallback_PeerConnectivityCheck( const RecvSTUNPktInfo_t &info );
 
         void OnPacketReceived( const RecvPktInfo_t &info, ICESessionInterface *pInterface, netadr_t *pAddrRelay = nullptr );
